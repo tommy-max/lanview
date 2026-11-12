@@ -1,0 +1,2342 @@
+#!/usr/bin/env python3
+"""
+lanview - Unbeaufsichtigtes Linux/Wayland Remote-Desktop-Tool über SSH (DRM/KMS + uinput)
+
+Funktionen:
+- Direktverbindung über SSH-Schlüssel (kein externer Server, kein offener Port nötig)
+- 100 % unbeaufsichtigtes Screen-Sharing unter Wayland & X11 via Kernel DRM/KMS + VAAPI Hardware-Encoding
+- Credit-basiertes Zero-Lag-Streaming (max. 2 Frames in Flight -> kein Puffer-Stau bei Login/Sitzungswechsel)
+- Automatischer DRM/CRTC-Watchdog bei Login / Modeset / Lockscreen-Wechsel
+- Live-Bildschirmauswahl (Monitor 1, Monitor 2, Monitor 3 ...) mit Ladeanimation & sofortigem Umschalten
+- Verzögerungsfreie Maus- und Tastatursteuerung über Kernel /dev/uinput (inkl. nativer Linux-Scancodes)
+"""
+
+import sys
+import os
+import re
+import json
+import time
+import base64
+import zlib
+import shlex
+import struct
+import threading
+import subprocess
+import argparse
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QSize, QTimer, QRectF
+from PyQt6.QtGui import (
+    QImage, QPixmap, QPainter, QColor, QFont, QIcon,
+    QKeyEvent, QMouseEvent, QWheelEvent, QPen
+)
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QStackedWidget, QScrollArea,
+    QComboBox, QPushButton, QLabel, QCheckBox, QStatusBar,
+    QSizePolicy, QMessageBox, QFrame
+)
+
+STATIONS_CONFIG_DIR = os.path.expanduser("~/.config/lanview/stations")
+
+# ============================================================================
+# REMOTE AGENT SCRIPT (läuft per SSH auf dem Ziel-PC)
+# ============================================================================
+REMOTE_AGENT_CODE = r'''
+import sys
+import os
+import re
+import time
+import json
+import fcntl
+import struct
+import ctypes
+import hashlib
+import threading
+import subprocess
+
+# --- 1. DRM / KMS Monitor- & CRTC-Erkennung ---
+CONN_TYPES = {
+    0: "Unknown", 1: "VGA", 2: "DVI-I", 3: "DVI-D", 4: "DVI-A",
+    5: "Composite", 6: "SVIDEO", 7: "LVDS", 8: "Component", 9: "9PinDIN",
+    10: "DP", 11: "HDMI-A", 12: "HDMI-B", 13: "TV", 14: "eDP",
+    15: "Virtual", 16: "DSI", 17: "DPI", 18: "Writeback", 19: "SPI", 20: "USB"
+}
+
+class drmModeRes(ctypes.Structure):
+    _fields_ = [
+        ("count_fbs", ctypes.c_int), ("fbs", ctypes.POINTER(ctypes.c_uint32)),
+        ("count_crtcs", ctypes.c_int), ("crtcs", ctypes.POINTER(ctypes.c_uint32)),
+        ("count_connectors", ctypes.c_int), ("connectors", ctypes.POINTER(ctypes.c_uint32)),
+        ("count_encoders", ctypes.c_int), ("encoders", ctypes.POINTER(ctypes.c_uint32)),
+        ("min_width", ctypes.c_uint32), ("max_width", ctypes.c_uint32),
+        ("min_height", ctypes.c_uint32), ("max_height", ctypes.c_uint32),
+    ]
+
+class drmModeModeInfo(ctypes.Structure):
+    _fields_ = [
+        ("clock", ctypes.c_uint32),
+        ("hdisplay", ctypes.c_uint16), ("hsync_start", ctypes.c_uint16), ("hsync_end", ctypes.c_uint16), ("htotal", ctypes.c_uint16), ("hskew", ctypes.c_uint16),
+        ("vdisplay", ctypes.c_uint16), ("vsync_start", ctypes.c_uint16), ("vsync_end", ctypes.c_uint16), ("vtotal", ctypes.c_uint16), ("vscan", ctypes.c_uint16),
+        ("vrefresh", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("type", ctypes.c_uint32),
+        ("name", ctypes.c_char * 32),
+    ]
+
+class drmModeCrtc(ctypes.Structure):
+    _fields_ = [
+        ("crtc_id", ctypes.c_uint32), ("buffer_id", ctypes.c_uint32),
+        ("x", ctypes.c_uint32), ("y", ctypes.c_uint32),
+        ("width", ctypes.c_uint32), ("height", ctypes.c_uint32),
+        ("mode_valid", ctypes.c_int), ("mode", drmModeModeInfo),
+        ("gamma_size", ctypes.c_int),
+    ]
+
+class drmModeEncoder(ctypes.Structure):
+    _fields_ = [
+        ("encoder_id", ctypes.c_uint32), ("encoder_type", ctypes.c_uint32),
+        ("crtc_id", ctypes.c_uint32), ("possible_crtcs", ctypes.c_uint32), ("possible_clones", ctypes.c_uint32),
+    ]
+
+class drmModeConnector(ctypes.Structure):
+    _fields_ = [
+        ("connector_id", ctypes.c_uint32), ("encoder_id", ctypes.c_uint32),
+        ("connector_type", ctypes.c_uint32), ("connector_type_id", ctypes.c_uint32),
+        ("connection", ctypes.c_int),
+        ("mmWidth", ctypes.c_uint32), ("mmHeight", ctypes.c_uint32),
+        ("subpixel", ctypes.c_int),
+        ("count_modes", ctypes.c_int), ("modes", ctypes.POINTER(drmModeModeInfo)),
+    ]
+
+class drmModeFB2(ctypes.Structure):
+    _fields_ = [
+        ("fb_id", ctypes.c_uint32),
+        ("width", ctypes.c_uint32), ("height", ctypes.c_uint32),
+        ("pixel_format", ctypes.c_uint32),
+        ("modifier", ctypes.c_uint64),
+        ("flags", ctypes.c_uint32),
+        ("handles", ctypes.c_uint32 * 4),
+        ("pitches", ctypes.c_uint32 * 4),
+        ("offsets", ctypes.c_uint32 * 4),
+    ]
+
+out_lock = threading.Lock()
+stdout_bin = os.fdopen(os.dup(1), "wb", buffering=0)
+os.dup2(2, 1)  # Normale Prints auf stderr umleiten
+
+def send_packet(magic: bytes, payload: bytes):
+    header = magic + struct.pack(">I", len(payload))
+    with out_lock:
+        stdout_bin.write(header + payload)
+        stdout_bin.flush()
+
+def send_json(obj: dict):
+    raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    send_packet(b"LVJS", raw)
+
+def send_frame(mon_index: int, jpeg_bytes: bytes):
+    # 1 Byte Monitor-Index vor den JPEG-Daten, damit der Client beim Umschalten alte Frames sofort erkennt
+    payload = struct.pack("B", int(mon_index) & 0xFF) + jpeg_bytes
+    send_packet(b"LVFR", payload)
+
+def wake_screens(uinput=None):
+    """Weckt DPMS / Bildschirme unter KDE Wayland & X11 zuverlässig auf."""
+    try:
+        if uinput is not None:
+            uinput.move_abs(960, 540, 1920, 1080)
+    except Exception:
+        pass
+    try:
+        for uid_dir in os.listdir("/run/user"):
+            if not uid_dir.isdigit():
+                continue
+            uid_int = int(uid_dir)
+            rdir = f"/run/user/{uid_dir}"
+            bus_path = f"{rdir}/bus"
+            if os.path.exists(bus_path):
+                for qbin in ("qdbus6", "qdbus"):
+                    subprocess.run(
+                        [
+                            "sudo", "-u", f"#{uid_int}",
+                            "env", f"XDG_RUNTIME_DIR={rdir}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus_path}",
+                            qbin, "org.kde.Solid.PowerManagement", "/org/kde/Solid/PowerManagement", "wakeup"
+                        ],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+                    )
+                    subprocess.run(
+                        [
+                            "sudo", "-u", f"#{uid_int}",
+                            "env", f"XDG_RUNTIME_DIR={rdir}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus_path}",
+                            qbin, "org.freedesktop.ScreenSaver", "/ScreenSaver", "SimulateUserActivity"
+                        ],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+                    )
+                    break
+    except Exception:
+        pass
+
+def get_kscreen_positions():
+    """Liest die exakten Monitor-Positionen (x, y, width, height) unter Wayland (KDE kscreen-doctor, wlroots wlr-randr, Hyprland)."""
+    pos_map = {}
+    try:
+        for uid_dir in os.listdir("/run/user"):
+            if not uid_dir.isdigit():
+                continue
+            rdir = f"/run/user/{uid_dir}"
+            uid_int = int(uid_dir)
+            wayland_sock = None
+            for entry in sorted(os.listdir(rdir)):
+                if re.match(r"^wayland-\d+$", entry):
+                    wayland_sock = entry
+                    break
+            if not wayland_sock:
+                continue
+            base_env = ["sudo", "-u", f"#{uid_int}", "env", f"XDG_RUNTIME_DIR={rdir}", f"WAYLAND_DISPLAY={wayland_sock}"]
+            # 1. KDE Plasma Wayland (kscreen-doctor -j)
+            res = subprocess.run(base_env + ["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=3)
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                for o in data.get("outputs", []):
+                    if o.get("connected") and o.get("enabled"):
+                        name = o.get("name", "")
+                        pos = o.get("pos", {})
+                        size = o.get("size", {})
+                        scale = float(o.get("scale", 1.0) or 1.0)
+                        pos_map[name] = {
+                            "x": int(pos.get("x", 0)),
+                            "y": int(pos.get("y", 0)),
+                            "width": int(round(size.get("width", 1920) / scale)),
+                            "height": int(round(size.get("height", 1080) / scale)),
+                            "phys_width": int(size.get("width", 1920)),
+                            "phys_height": int(size.get("height", 1080)),
+                            "priority": int(o.get("priority", 99))
+                        }
+                if pos_map:
+                    return pos_map
+            # 2. Sway / wlroots Wayland (wlr-randr --json)
+            res = subprocess.run(base_env + ["wlr-randr", "--json"], capture_output=True, text=True, timeout=3)
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                for o in data:
+                    if o.get("enabled"):
+                        name = o.get("name", "")
+                        pos = o.get("position", {})
+                        scale = float(o.get("scale", 1.0) or 1.0)
+                        w, h = 1920, 1080
+                        for m in o.get("modes", []):
+                            if m.get("current"):
+                                w = int(m.get("width", 1920))
+                                h = int(m.get("height", 1080))
+                                break
+                        pos_map[name] = {
+                            "x": int(pos.get("x", 0)),
+                            "y": int(pos.get("y", 0)),
+                            "width": int(round(w / scale)),
+                            "height": int(round(h / scale)),
+                            "phys_width": w,
+                            "phys_height": h,
+                            "priority": 1
+                        }
+                if pos_map:
+                    return pos_map
+    except Exception:
+        pass
+    return pos_map
+
+libdrm = ctypes.CDLL("libdrm.so.2")
+libdrm.drmModeGetResources.restype = ctypes.POINTER(drmModeRes)
+libdrm.drmModeGetCrtc.restype = ctypes.POINTER(drmModeCrtc)
+libdrm.drmModeGetEncoder.restype = ctypes.POINTER(drmModeEncoder)
+libdrm.drmModeGetConnectorCurrent.restype = ctypes.POINTER(drmModeConnector)
+try:
+    libdrm.drmModeGetFB2.restype = ctypes.POINTER(drmModeFB2)
+    libdrm.drmModeFreeFB2.argtypes = [ctypes.POINTER(drmModeFB2)]
+    HAS_FB2 = True
+except Exception:
+    HAS_FB2 = False
+
+def query_drm_state(card_filter=None):
+    """Liest den aktuellen DRM-Zustand (Connectors -> CRTCs -> FB-IDs) schnell aus."""
+    cards = [card_filter] if card_filter else sorted([
+        f"/dev/dri/{d}" for d in os.listdir("/dev/dri")
+        if re.match(r"^card\d+$", d)
+    ])
+    for card_path in cards:
+        try:
+            fd = os.open(card_path, os.O_RDWR)
+        except Exception:
+            continue
+        try:
+            res_ptr = libdrm.drmModeGetResources(fd)
+            if not res_ptr:
+                os.close(fd)
+                continue
+            res = res_ptr.contents
+            card_mons = []
+            for i in range(res.count_connectors):
+                conn_id = res.connectors[i]
+                conn_ptr = libdrm.drmModeGetConnectorCurrent(fd, conn_id)
+                if not conn_ptr:
+                    continue
+                conn = conn_ptr.contents
+                cname = f"{CONN_TYPES.get(conn.connector_type, str(conn.connector_type))}-{conn.connector_type_id}"
+                if conn.connection == 1 and conn.encoder_id:
+                    enc_ptr = libdrm.drmModeGetEncoder(fd, conn.encoder_id)
+                    if not enc_ptr or not enc_ptr.contents.crtc_id:
+                        continue
+                    crtc_id = enc_ptr.contents.crtc_id
+                    crtc_ptr = libdrm.drmModeGetCrtc(fd, crtc_id)
+                    if not crtc_ptr:
+                        continue
+                    crtc = crtc_ptr.contents
+                    w = int(crtc.width) if crtc.width > 0 else 1920
+                    h = int(crtc.height) if crtc.height > 0 else 1080
+                    needs_gbm = False
+                    if HAS_FB2 and crtc.buffer_id:
+                        try:
+                            fb2_ptr = libdrm.drmModeGetFB2(fd, crtc.buffer_id)
+                            if fb2_ptr:
+                                fb2 = fb2_ptr.contents
+                                # Multi-Plane CCS-Kompression (z. B. Intel Gen12+ Iris Xe auf ws5)
+                                # oder 10-Bit-Farbtiefe (AB30/XB30/AR30/XR30) -> GBM Multi-Plane Decompressor nutzen!
+                                if fb2.handles[1] != 0 or fb2.pixel_format in (0x30334241, 0x30334258, 0x30335241, 0x30335258):
+                                    needs_gbm = True
+                                libdrm.drmModeFreeFB2(fb2_ptr)
+                        except Exception:
+                            pass
+                    card_mons.append({
+                        "name": cname,
+                        "card": card_path,
+                        "connector_id": int(conn_id),
+                        "crtc_id": int(crtc_id),
+                        "fb_id": int(crtc.buffer_id),
+                        "mode_valid": int(crtc.mode_valid),
+                        "x": int(crtc.x),
+                        "y": int(crtc.y),
+                        "width": w,
+                        "height": h,
+                        "needs_gbm": needs_gbm,
+                    })
+            os.close(fd)
+            if card_mons:
+                return card_path, card_mons
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+    return None, []
+
+def ensure_gbm_grab_binary():
+    """
+    Kompiliert bei Bedarf /tmp/lanview_gbm_grab_v1 (nutzt libdrm + libgbm + libturbojpeg),
+    das 3-Plane Intel Gen12 CCS-komprimierte sowie 10-Bit (AB30/XB30) Framebuffer
+    über den Mesa-GPU-Treiber artefaktfrei entpackt und per SIMD-TurboJPEG komprimiert.
+    """
+    bin_path = "/tmp/lanview_gbm_grab_v1"
+    if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
+        return bin_path
+    c_code = "\n".join([
+        "#include <stdio.h>",
+        "#include <stdlib.h>",
+        "#include <stdint.h>",
+        "#include <string.h>",
+        "#include <fcntl.h>",
+        "#include <unistd.h>",
+        "#include <time.h>",
+        "#include <xf86drm.h>",
+        "#include <xf86drmMode.h>",
+        "#include <gbm.h>",
+        "#include <turbojpeg.h>",
+        "int main(int argc, char **argv) {",
+        "    if (argc < 7) return 1;",
+        "    const char *card = argv[1];",
+        "    uint32_t crtc_id = (uint32_t)atoi(argv[2]);",
+        "    int fps = atoi(argv[3]);",
+        "    int out_w = atoi(argv[4]);",
+        "    int out_h = atoi(argv[5]);",
+        "    int quality = atoi(argv[6]);",
+        "    if (fps < 1) fps = 25;",
+        "    int fd = open(card, O_RDWR | O_CLOEXEC);",
+        "    if (fd < 0) return 1;",
+        "    struct gbm_device *gbm = gbm_create_device(fd);",
+        "    if (!gbm) return 1;",
+        "    tjhandle tj = tjInitCompress();",
+        "    if (!tj) return 1;",
+        "    uint8_t *rgb = malloc((size_t)out_w * out_h * 4);",
+        "    int *x_map = malloc(sizeof(int) * out_w);",
+        "    uint64_t frame_us = 1000000ULL / (uint64_t)fps;",
+        "    while (1) {",
+        "        struct timespec t0, t1;",
+        "        clock_gettime(CLOCK_MONOTONIC, &t0);",
+        "        drmModeCrtc *crtc = drmModeGetCrtc(fd, crtc_id);",
+        "        if (!crtc || !crtc->buffer_id) {",
+        "            if (crtc) drmModeFreeCrtc(crtc);",
+        "            usleep(40000);",
+        "            continue;",
+        "        }",
+        "        uint32_t fb_id = crtc->buffer_id;",
+        "        drmModeFreeCrtc(crtc);",
+        "        drmModeFB2 *fb2 = drmModeGetFB2(fd, fb_id);",
+        "        if (!fb2) { usleep(40000); continue; }",
+        "        struct gbm_import_fd_modifier_data imp;",
+        "        memset(&imp, 0, sizeof(imp));",
+        "        imp.width = fb2->width;",
+        "        imp.height = fb2->height;",
+        "        imp.format = fb2->pixel_format;",
+        "        imp.modifier = (fb2->flags & DRM_MODE_FB_MODIFIERS) ? fb2->modifier : 0ULL;",
+        "        for (int i = 0; i < 4 && fb2->handles[i]; i++) {",
+        "            int pfd = -1;",
+        "            if (drmPrimeHandleToFD(fd, fb2->handles[i], DRM_CLOEXEC, &pfd) == 0 && pfd >= 0) {",
+        "                imp.fds[i] = pfd;",
+        "                imp.strides[i] = fb2->pitches[i];",
+        "                imp.offsets[i] = fb2->offsets[i];",
+        "                imp.num_fds = i + 1;",
+        "            } else break;",
+        "        }",
+        "        struct gbm_bo *bo = NULL;",
+        "        if (imp.num_fds > 0) {",
+        "            if (fb2->flags & DRM_MODE_FB_MODIFIERS) {",
+        "                bo = gbm_bo_import(gbm, GBM_BO_IMPORT_FD_MODIFIER, &imp, 0);",
+        "            } else {",
+        "                struct gbm_import_fd_data imp1 = { imp.fds[0], fb2->width, fb2->height, fb2->pitches[0], fb2->pixel_format };",
+        "                bo = gbm_bo_import(gbm, GBM_BO_IMPORT_FD, &imp1, 0);",
+        "            }",
+        "        }",
+        "        for (int i = 0; i < imp.num_fds; i++) if (imp.fds[i] >= 0) close(imp.fds[i]);",
+        "        if (!bo) { drmModeFreeFB2(fb2); usleep(40000); continue; }",
+        "        uint32_t stride = 0;",
+        "        void *map_data = NULL;",
+        "        void *ptr = gbm_bo_map(bo, 0, 0, fb2->width, fb2->height, GBM_BO_TRANSFER_READ, &stride, &map_data);",
+        "        if (ptr) {",
+        "            uint32_t sw = fb2->width, sh = fb2->height, fmt = fb2->pixel_format;",
+        "            for (int x = 0; x < out_w; x++) x_map[x] = (int)((uint64_t)x * sw / out_w);",
+        "            int is_10bit_bgr = (fmt == 0x30334241 || fmt == 0x30334258);",
+        "            int is_10bit_rgb = (fmt == 0x30335241 || fmt == 0x30335258);",
+        "            int is_8bit_bgr  = (fmt == 0x34324241 || fmt == 0x34324258);",
+        "            for (int y = 0; y < out_h; y++) {",
+        "                uint32_t sy = (uint32_t)((uint64_t)y * sh / out_h);",
+        "                const uint32_t *src = (const uint32_t *)((const uint8_t *)ptr + (size_t)sy * stride);",
+        "                uint8_t *dst = rgb + (size_t)y * out_w * 4;",
+        "                if (is_10bit_bgr) {",
+        "                    for (int x = 0; x < out_w; x++) {",
+        "                        uint32_t v = src[x_map[x]];",
+        "                        dst[x*4+0] = (v >> 2) & 0xFF; dst[x*4+1] = (v >> 12) & 0xFF; dst[x*4+2] = (v >> 22) & 0xFF; dst[x*4+3] = 255;",
+        "                    }",
+        "                } else if (is_10bit_rgb) {",
+        "                    for (int x = 0; x < out_w; x++) {",
+        "                        uint32_t v = src[x_map[x]];",
+        "                        dst[x*4+0] = (v >> 22) & 0xFF; dst[x*4+1] = (v >> 12) & 0xFF; dst[x*4+2] = (v >> 2) & 0xFF; dst[x*4+3] = 255;",
+        "                    }",
+        "                } else if (is_8bit_bgr) {",
+        "                    for (int x = 0; x < out_w; x++) {",
+        "                        uint32_t v = src[x_map[x]];",
+        "                        dst[x*4+0] = v & 0xFF; dst[x*4+1] = (v >> 8) & 0xFF; dst[x*4+2] = (v >> 16) & 0xFF; dst[x*4+3] = 255;",
+        "                    }",
+        "                } else {",
+        "                    for (int x = 0; x < out_w; x++) {",
+        "                        uint32_t v = src[x_map[x]];",
+        "                        dst[x*4+0] = (v >> 16) & 0xFF; dst[x*4+1] = (v >> 8) & 0xFF; dst[x*4+2] = v & 0xFF; dst[x*4+3] = 255;",
+        "                    }",
+        "                }",
+        "            }",
+        "            gbm_bo_unmap(bo, map_data);",
+        "            unsigned char *jpeg_buf = NULL;",
+        "            unsigned long jpeg_size = 0;",
+        "            if (tjCompress2(tj, rgb, out_w, 0, out_h, TJPF_RGBA, &jpeg_buf, &jpeg_size, TJSAMP_420, quality, TJFLAG_FASTDCT) == 0) {",
+        "                size_t wr = fwrite(jpeg_buf, 1, jpeg_size, stdout);",
+        "                fflush(stdout);",
+        "                tjFree(jpeg_buf);",
+        "                if (wr != jpeg_size) { gbm_bo_destroy(bo); drmModeFreeFB2(fb2); break; }",
+        "            }",
+        "        }",
+        "        gbm_bo_destroy(bo);",
+        "        drmModeFreeFB2(fb2);",
+        "        clock_gettime(CLOCK_MONOTONIC, &t1);",
+        "        uint64_t el = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000ULL + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000ULL;",
+        "        if (el < frame_us) usleep((useconds_t)(frame_us - el));",
+        "    }",
+        "    return 0;",
+        "}",
+    ])
+    try:
+        c_path = "/tmp/lanview_gbm_grab_v1.c"
+        with open(c_path, "w", encoding="utf-8") as f:
+            f.write(c_code)
+        subprocess.run(
+            ["gcc", "-O3", c_path, "-o", bin_path, "-I/usr/include/libdrm", "-ldrm", "-lgbm", "-lturbojpeg"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6
+        )
+        if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
+            return bin_path
+    except Exception:
+        pass
+    return None
+
+def detect_x11_env():
+    """Prüft, ob ein Xorg-Server läuft (z. B. SDDM oder X11-Session auf NVIDIA/ws4) und liefert (display, xauth)."""
+    try:
+        res = subprocess.run(["ps", "-ef"], capture_output=True, text=True, timeout=2)
+        for line in res.stdout.splitlines():
+            if "Xorg" in line and "-auth" in line:
+                m_auth = re.search(r"-auth\s+(\S+)", line)
+                m_disp = re.search(r"\s(:\d+)\s", line)
+                xauth = m_auth.group(1) if m_auth else ""
+                disp = m_disp.group(1) if m_disp else ":0"
+                if xauth and os.path.exists(xauth):
+                    return disp, xauth
+    except Exception:
+        pass
+    return None, None
+
+def ensure_headless_x11_output(disp: str, xauth: str):
+    """
+    Falls alle physischen Monitore ausgeschaltet sind (z. B. ws4 mit ausgeschaltetem Monitor),
+    aktiviert dies einen Connector im Kernel/Xrandr auf 1920x1080, damit SDDM/Desktop sichtbar ist.
+    """
+    env = dict(os.environ, DISPLAY=disp, XAUTHORITY=xauth)
+    try:
+        # Prüfen, ob in sysfs überhaupt ein Connector 'connected' ist
+        any_conn = False
+        sys_drm = "/sys/class/drm"
+        candidate_status = None
+        if os.path.isdir(sys_drm):
+            for entry in sorted(os.listdir(sys_drm)):
+                st_path = os.path.join(sys_drm, entry, "status")
+                if os.path.isfile(st_path):
+                    with open(st_path, "r") as f:
+                        st = f.read().strip()
+                    if st == "connected":
+                        any_conn = True
+                    elif candidate_status is None and ("HDMI" in entry or "DP" in entry):
+                        candidate_status = st_path
+        if not any_conn and candidate_status:
+            with open(candidate_status, "w") as f:
+                f.write("on\n")
+        subprocess.run(["xrandr", "--fb", "1920x1080"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        xr = subprocess.run(["xrandr", "--query"], env=env, capture_output=True, text=True, timeout=2).stdout
+        for line in xr.splitlines():
+            if " connected" in line and "1920x1080" not in line:
+                out_name = line.split()[0]
+                subprocess.run(
+                    ["xrandr", "--newmode", "1920x1080_60", "148.50", "1920", "2008", "2052", "2200", "1080", "1084", "1089", "1125", "+hsync", "+vsync"],
+                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+                )
+                subprocess.run(["xrandr", "--addmode", out_name, "1920x1080_60"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                subprocess.run(["xrandr", "--output", out_name, "--mode", "1920x1080_60", "--primary"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                break
+    except Exception:
+        pass
+
+def discover_drm_monitors(uinput=None):
+    """Findet das aktive DRM-Device (/dev/dri/card*) und alle aktiven Monitore + CRTCs (inkl. X11/NVIDIA-Fallback)."""
+    kscreen_map = get_kscreen_positions()
+    x11_disp, x11_auth = detect_x11_env()
+    chosen_card = None
+    monitors = []
+
+    for attempt in range(4):
+        chosen_card, raw_mons = query_drm_state()
+        if raw_mons:
+            for m in raw_mons:
+                cname = m["name"]
+                if cname in kscreen_map:
+                    m["x"] = kscreen_map[cname]["x"]
+                    m["y"] = kscreen_map[cname]["y"]
+                    m["width"] = kscreen_map[cname]["width"]
+                    m["height"] = kscreen_map[cname]["height"]
+                if x11_disp and x11_auth:
+                    m["x11_display"] = x11_disp
+                    m["x11_auth"] = x11_auth
+            monitors = raw_mons
+            threading.Thread(target=wake_screens, args=(uinput,), daemon=True).start()
+            break
+        if attempt == 0 and x11_disp and x11_auth:
+            ensure_headless_x11_output(x11_disp, x11_auth)
+        wake_screens(uinput)
+        time.sleep(0.25)
+
+    if not monitors and x11_disp and x11_auth:
+        ensure_headless_x11_output(x11_disp, x11_auth)
+        chosen_card = "x11"
+        monitors = [{
+            "name": "X11-0",
+            "card": "x11",
+            "connector_id": 1,
+            "crtc_id": 1,
+            "fb_id": 1,
+            "mode_valid": 1,
+            "x": 0,
+            "y": 0,
+            "width": 1920,
+            "height": 1080,
+            "x11_display": x11_disp,
+            "x11_auth": x11_auth,
+        }]
+
+    monitors.sort(key=lambda m: (m["x"], m["y"], m["name"]))
+
+    if len(monitors) > 1 and all(m["x"] == 0 and m["y"] == 0 for m in monitors):
+        cur_x = 0
+        for m in monitors:
+            m["x"] = cur_x
+            cur_x += m["width"]
+
+    for idx, m in enumerate(monitors, 1):
+        m["index"] = idx
+        m["label"] = f"Monitor {idx}: {m['name']} ({m['width']}x{m['height']} @ {m['x']},{m['y']})"
+
+    total_w = max((m["x"] + m["width"] for m in monitors), default=1920)
+    total_h = max((m["y"] + m["height"] for m in monitors), default=1080)
+    return chosen_card, monitors, total_w, total_h
+
+
+# --- 2. Kernel /dev/uinput Maus & Tastatur ---
+UI_SET_EVBIT   = 0x40045564
+UI_SET_KEYBIT  = 0x40045565
+UI_SET_RELBIT  = 0x40045566
+UI_SET_ABSBIT  = 0x40045567
+UI_DEV_CREATE  = 0x5501
+UI_DEV_DESTROY = 0x5502
+
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_REL = 0x02
+EV_ABS = 0x03
+
+ABS_X = 0x00
+ABS_Y = 0x01
+REL_WHEEL  = 0x08
+REL_HWHEEL = 0x06
+
+BTN_LEFT   = 0x110
+BTN_RIGHT  = 0x111
+BTN_MIDDLE = 0x112
+BTN_SIDE   = 0x113
+BTN_EXTRA  = 0x114
+
+def ensure_uinput_module():
+    """Stellt sicher, dass /dev/uinput geöffnet werden kann (lädt Modul ggf. auch nach Kernel-Update aus Pacman-Cache)."""
+    try:
+        fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        return
+    except Exception:
+        pass
+    subprocess.run(["modprobe", "uinput"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        return
+    except Exception:
+        pass
+    try:
+        kver = os.uname().release
+        mod_rel = f"usr/lib/modules/{kver}/kernel/drivers/input/misc/uinput.ko.zst"
+        pkg_dir = "/var/cache/pacman/pkg"
+        if os.path.isdir(pkg_dir):
+            for fn in os.listdir(pkg_dir):
+                if fn.startswith(f"linux-{kver.replace('-arch', '.arch')}") and fn.endswith(".pkg.tar.zst"):
+                    pkg_path = os.path.join(pkg_dir, fn)
+                    subprocess.run(["tar", "-xf", pkg_path, "-C", "/", mod_rel], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                    ko_zst = "/" + mod_rel
+                    if os.path.isfile(ko_zst):
+                        subprocess.run(["zstd", "-d", "-f", ko_zst, "-o", "/tmp/uinput.ko"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                        subprocess.run(["insmod", "/tmp/uinput.ko"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                        try:
+                            os.remove("/tmp/uinput.ko")
+                        except Exception:
+                            pass
+                    break
+    except Exception:
+        pass
+
+
+class UInputController:
+    def __init__(self):
+        self.ptr_fd = None
+        self.kbd_fd = None
+        ensure_uinput_module()
+        try:
+            self._init_pointer()
+            self._init_keyboard()
+        except Exception:
+            self.ptr_fd = None
+            self.kbd_fd = None
+
+    def _init_pointer(self):
+        self.ptr_fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        for ev in (EV_SYN, EV_KEY, EV_ABS, EV_REL):
+            fcntl.ioctl(self.ptr_fd, UI_SET_EVBIT, ev)
+        for btn in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA):
+            fcntl.ioctl(self.ptr_fd, UI_SET_KEYBIT, btn)
+        for axis in (ABS_X, ABS_Y):
+            fcntl.ioctl(self.ptr_fd, UI_SET_ABSBIT, axis)
+        for rel in (REL_WHEEL, REL_HWHEEL):
+            fcntl.ioctl(self.ptr_fd, UI_SET_RELBIT, rel)
+
+        name = b"lanview-abs-pointer" + b"\x00" * (80 - 19)
+        id_struct = struct.pack("HHHH", 0x03, 0x1234, 0x5678, 1)
+        absmax = [0] * 64
+        absmin = [0] * 64
+        absfuzz = [0] * 64
+        absflat = [0] * 64
+        absmax[ABS_X] = 65535
+        absmax[ABS_Y] = 65535
+        udev = (
+            name + id_struct + struct.pack("I", 0)
+            + struct.pack("64i", *absmax)
+            + struct.pack("64i", *absmin)
+            + struct.pack("64i", *absfuzz)
+            + struct.pack("64i", *absflat)
+        )
+        os.write(self.ptr_fd, udev)
+        fcntl.ioctl(self.ptr_fd, UI_DEV_CREATE)
+
+    def _init_keyboard(self):
+        self.kbd_fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        for ev in (EV_SYN, EV_KEY):
+            fcntl.ioctl(self.kbd_fd, UI_SET_EVBIT, ev)
+        for k in range(1, 248):
+            fcntl.ioctl(self.kbd_fd, UI_SET_KEYBIT, k)
+
+        name = b"lanview-keyboard" + b"\x00" * (80 - 16)
+        id_struct = struct.pack("HHHH", 0x03, 0x1234, 0x5679, 1)
+        zeros = [0] * 64
+        udev = (
+            name + id_struct + struct.pack("I", 0)
+            + struct.pack("64i", *zeros)
+            + struct.pack("64i", *zeros)
+            + struct.pack("64i", *zeros)
+            + struct.pack("64i", *zeros)
+        )
+        os.write(self.kbd_fd, udev)
+        fcntl.ioctl(self.kbd_fd, UI_DEV_CREATE)
+
+    def _emit(self, fd, ev_type, code, val):
+        if fd is not None:
+            os.write(fd, struct.pack("llHHi", 0, 0, ev_type, code, int(val)))
+
+    def move_abs(self, global_x: float, global_y: float, total_w: int, total_h: int):
+        ax = max(0, min(65535, int(global_x * 65535 / max(1, total_w))))
+        ay = max(0, min(65535, int(global_y * 65535 / max(1, total_h))))
+        self._emit(self.ptr_fd, EV_ABS, ABS_X, ax)
+        self._emit(self.ptr_fd, EV_ABS, ABS_Y, ay)
+        self._emit(self.ptr_fd, EV_SYN, 0, 0)
+
+    def button(self, btn_code: int, pressed: bool):
+        self._emit(self.ptr_fd, EV_KEY, btn_code, 1 if pressed else 0)
+        self._emit(self.ptr_fd, EV_SYN, 0, 0)
+
+    def wheel(self, dy: int, dx: int = 0):
+        if dy != 0:
+            self._emit(self.ptr_fd, EV_REL, REL_WHEEL, dy)
+        if dx != 0:
+            self._emit(self.ptr_fd, EV_REL, REL_HWHEEL, dx)
+        self._emit(self.ptr_fd, EV_SYN, 0, 0)
+
+    def key(self, evdev_code: int, pressed: bool):
+        if 1 <= evdev_code <= 247:
+            self._emit(self.kbd_fd, EV_KEY, evdev_code, 1 if pressed else 0)
+            self._emit(self.kbd_fd, EV_SYN, 0, 0)
+
+    def close(self):
+        for fd in (self.ptr_fd, self.kbd_fd):
+            if fd is not None:
+                try:
+                    fcntl.ioctl(fd, UI_DEV_DESTROY)
+                except Exception:
+                    pass
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+
+
+# --- 3. Zero-Lag Streamer mit Backpressure & Login-/Modeset-Watchdog ---
+class StreamWorker:
+    def __init__(self, card_path, monitors, total_w, total_h, uinput=None):
+        self.card_path = card_path
+        self.monitors = monitors
+        self.total_w = total_w
+        self.total_h = total_h
+        self.uinput = uinput
+        self.current_mon = monitors[0] if monitors else None
+        self.fps = 30
+        self.scale_pct = 100
+        self.quality = 80
+        self.proc = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+
+        # Credit-basierte Flusskontrolle (verhindert jeglichen Buffer-Stau in SSH/TCP!)
+        self.cond = threading.Condition()
+        self.credits = 2
+        self.latest_frame = None   # (seq, mon_index, jpeg_bytes, digest)
+        self.frame_seq = 0
+        self.sent_seq = 0
+        self.last_capture_ts = time.time()
+        self.force_next_frame = True
+        self.probing_modes = False
+        self.working_mode_by_mon = {}
+        self.gbm_grab_bin = ensure_gbm_grab_binary()
+
+        self.sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
+        self.sender_thread.start()
+
+        self.watchdog_thread = threading.Thread(target=self._drm_watchdog_loop, daemon=True)
+        self.watchdog_thread.start()
+
+    def on_client_ack(self):
+        with self.cond:
+            self.credits = min(3, self.credits + 1)
+            self.cond.notify_all()
+
+    def notify_user_input(self):
+        """Erzwingt nach Tastatur-/Mauseingaben sofortiges Senden neuer Frames."""
+        with self.cond:
+            self.force_next_frame = True
+            self.cond.notify_all()
+
+    def start_stream(self, mon_index=None, fps=None, scale_pct=None, quality=None, force_restart=False):
+        with self.lock:
+            target_mon = self.current_mon
+            if mon_index is not None:
+                for m in self.monitors:
+                    if m["index"] == mon_index:
+                        target_mon = m
+                        break
+            new_fps = max(5, min(60, int(fps))) if fps is not None else self.fps
+            new_scale = max(25, min(100, int(scale_pct))) if scale_pct is not None else self.scale_pct
+            new_qual = max(30, min(95, int(quality))) if quality is not None else self.quality
+
+            if (
+                not force_restart
+                and self.proc is not None
+                and self.proc.poll() is None
+                and self.current_mon is not None
+                and target_mon is not None
+                and self.current_mon["index"] == target_mon["index"]
+                and new_fps == self.fps
+                and new_scale == self.scale_pct
+                and new_qual == self.quality
+            ):
+                return
+
+            self._stop_current()
+            self.current_mon = target_mon
+            self.fps = new_fps
+            self.scale_pct = new_scale
+            self.quality = new_qual
+
+            if not self.current_mon:
+                return
+
+            with self.cond:
+                self.latest_frame = None
+                self.credits = 2
+                self.force_next_frame = True
+                self.cond.notify_all()
+
+            self.stop_event = threading.Event()
+            t = threading.Thread(target=self._capture_loop, args=(self.stop_event, dict(self.current_mon)), daemon=True)
+            t.start()
+
+    def _stop_current(self):
+        self.stop_event.set()
+        if self.proc:
+            p = self.proc
+            self.proc = None
+            try:
+                p.kill()  # Sofort beenden (< 1ms) statt 1s zu warten -> schneller Monitorwechsel!
+                p.wait(timeout=0.2)
+            except Exception:
+                pass
+
+    def _build_ffmpeg_cmd(self, mon, mode="vaapi_hw"):
+        out_w = max(640, (int(mon["width"] * self.scale_pct / 100) // 2) * 2)
+        out_h = max(360, (int(mon["height"] * self.scale_pct / 100) // 2) * 2)
+        q_val = max(2, min(20, int((100 - self.quality) / 4)))
+        if mode == "gbm_grab":
+            return [
+                self.gbm_grab_bin,
+                mon["card"],
+                str(mon["crtc_id"]),
+                str(self.fps),
+                str(out_w),
+                str(out_h),
+                str(self.quality),
+            ]
+        elif mode == "x11grab":
+            disp = mon.get("x11_display") or ":0"
+            mx, my = int(mon.get("x", 0)), int(mon.get("y", 0))
+            mw, mh = int(mon.get("width", 1920)), int(mon.get("height", 1080))
+            return [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-fflags", "nobuffer", "-flags", "low_delay",
+                "-f", "x11grab",
+                "-framerate", str(self.fps),
+                "-video_size", f"{mw}x{mh}",
+                "-i", f"{disp}+{mx},{my}",
+                "-vf", f"scale=w={out_w}:h={out_h}",
+                "-c:v", "mjpeg",
+                "-q:v", str(q_val),
+                "-f", "image2pipe", "-"
+            ]
+        elif mode == "vaapi_hw":
+            return [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-fflags", "nobuffer", "-flags", "low_delay",
+                "-device", mon["card"],
+                "-crtc_id", str(mon["crtc_id"]),
+                "-framerate", str(self.fps),
+                "-f", "kmsgrab", "-i", "-",
+                "-vf", f"hwmap=derive_device=vaapi,scale_vaapi=w={out_w}:h={out_h}:format=nv12",
+                "-c:v", "mjpeg_vaapi",
+                "-global_quality", str(self.quality),
+                "-f", "image2pipe", "-"
+            ]
+        elif mode == "vaapi_sw":
+            return [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-fflags", "nobuffer", "-flags", "low_delay",
+                "-device", mon["card"],
+                "-crtc_id", str(mon["crtc_id"]),
+                "-framerate", str(self.fps),
+                "-f", "kmsgrab", "-i", "-",
+                "-vf", f"hwmap=derive_device=vaapi,scale_vaapi=w={out_w}:h={out_h}:format=nv12,hwdownload,format=nv12",
+                "-c:v", "mjpeg",
+                "-q:v", str(q_val),
+                "-f", "image2pipe", "-"
+            ]
+        else:
+            return [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-fflags", "nobuffer", "-flags", "low_delay",
+                "-device", mon["card"],
+                "-crtc_id", str(mon["crtc_id"]),
+                "-framerate", str(self.fps),
+                "-f", "kmsgrab", "-i", "-",
+                "-vf", f"hwdownload,format=bgr0,scale=w={out_w}:h={out_h}",
+                "-c:v", "mjpeg",
+                "-q:v", str(q_val),
+                "-f", "image2pipe", "-"
+            ]
+
+    def _capture_loop(self, stop_ev: threading.Event, mon: dict):
+        mon_idx = mon["index"]
+        if mon.get("card") == "x11":
+            modes = ["x11grab"]
+        else:
+            if mon.get("needs_gbm") and self.gbm_grab_bin:
+                base_modes = ["gbm_grab", "vaapi_hw", "vaapi_sw", "sw"]
+            elif self.gbm_grab_bin:
+                base_modes = ["vaapi_hw", "gbm_grab", "vaapi_sw", "sw"]
+            else:
+                base_modes = ["vaapi_hw", "vaapi_sw", "sw"]
+            if mon.get("x11_display") and mon.get("x11_auth"):
+                base_modes.append("x11grab")
+            pref = self.working_mode_by_mon.get(mon_idx)
+            if pref and pref in base_modes:
+                modes = [pref] + [m for m in base_modes if m != pref]
+            else:
+                modes = base_modes
+
+        self.probing_modes = True
+        for mode in modes:
+            if stop_ev.is_set():
+                self.probing_modes = False
+                return
+            self.last_capture_ts = time.time()
+            cmd = self._build_ffmpeg_cmd(mon, mode=mode)
+            env = dict(os.environ)
+            if mode == "x11grab":
+                if mon.get("x11_display"):
+                    env["DISPLAY"] = mon["x11_display"]
+                if mon.get("x11_auth"):
+                    env["XAUTHORITY"] = mon["x11_auth"]
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    bufsize=65536
+                )
+                self.proc = proc
+            except Exception as e:
+                send_json({"type": "error", "message": f"ffmpeg Startfehler: {e}"})
+                self.probing_modes = False
+                return
+
+            buf = bytearray()
+            got_valid_frame = False
+            stdout_pipe = proc.stdout
+            while not stop_ev.is_set():
+                chunk = stdout_pipe.read(32768)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                while True:
+                    soi = buf.find(b"\xff\xd8")
+                    if soi == -1:
+                        buf.clear()
+                        break
+                    if soi > 0:
+                        del buf[:soi]
+                    eoi = buf.find(b"\xff\xd9", 2)
+                    if eoi == -1:
+                        break
+                    frame = bytes(buf[:eoi + 2])
+                    del buf[:eoi + 2]
+                    # Falls auf Dual-GPU-Systemen (z. B. ws4 mit NVIDIA Xorg + leerer Intel-CRTC)
+                    # kmsgrab nur ein winziges komplett schwarzes Dummy-Frame (< 2500 Bytes) liefert
+                    # und X11 verfügbar ist, auf x11grab wechseln:
+                    if not got_valid_frame and len(frame) < 2500 and mode != "x11grab" and "x11grab" in modes:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        buf.clear()
+                        break
+                    got_valid_frame = True
+                    self.probing_modes = False
+                    self.working_mode_by_mon[mon_idx] = mode
+                    self.last_capture_ts = time.time()
+                    dg = hashlib.md5(frame[::16]).digest()
+                    with self.cond:
+                        self.frame_seq += 1
+                        self.latest_frame = (self.frame_seq, mon_idx, frame, dg)
+                        self.cond.notify_all()
+                if not got_valid_frame and proc.poll() is not None and not buf:
+                    break
+
+            if got_valid_frame or stop_ev.is_set():
+                break
+
+        self.probing_modes = False
+        if not stop_ev.is_set():
+            wake_screens(self.uinput)
+
+    def _sender_loop(self):
+        last_digest = None
+        last_sent_time = 0.0
+        last_mon_sent = None
+
+        while True:
+            with self.cond:
+                while (
+                    self.latest_frame is None
+                    or self.latest_frame[0] <= self.sent_seq
+                    or self.credits <= 0
+                ):
+                    self.cond.wait(timeout=0.5)
+                    # Sicherheits-Fallback falls ein ACK ausblieb
+                    if time.time() - last_sent_time > 0.6 and self.credits <= 0:
+                        self.credits = 1
+
+                seq, mon_idx, frame, dg = self.latest_frame
+                now = time.time()
+                # Wenn sich das Bild überhaupt nicht verändert hat und kein Monitorwechsel/Input vorlag:
+                # max. alle 0.4s ein Keepalive-Frame senden -> spart 90% Bandbreite im Standbild!
+                if (
+                    dg == last_digest
+                    and mon_idx == last_mon_sent
+                    and not self.force_next_frame
+                    and (now - last_sent_time) < 0.4
+                ):
+                    self.sent_seq = seq
+                    continue
+
+                self.sent_seq = seq
+                self.credits -= 1
+                self.force_next_frame = False
+                last_digest = dg
+                last_mon_sent = mon_idx
+                last_sent_time = now
+
+            try:
+                send_frame(mon_idx, frame)
+            except Exception:
+                break
+
+    def _drm_watchdog_loop(self):
+        """
+        Überwacht DRM/CRTC-Änderungen (z. B. beim Anmelden/Login in SDDM/KScreenLocker,
+        Auflösungswechsel oder kurzem Modeset) und startet ffmpeg bei Bedarf nahtlos neu.
+        """
+        last_fb_id = None
+        last_crtc_id = None
+        zero_fb_seen = False
+
+        while True:
+            time.sleep(0.75)
+            if self.probing_modes:
+                continue
+            cur_mon = self.current_mon
+            if not cur_mon or cur_mon.get("card") == "x11":
+                continue
+
+            _, raw_mons = query_drm_state(card_filter=cur_mon["card"])
+            if not raw_mons:
+                zero_fb_seen = True
+                continue
+
+            matched = None
+            for rm in raw_mons:
+                if rm["name"] == cur_mon["name"]:
+                    matched = rm
+                    break
+
+            if not matched:
+                continue
+
+            cur_crtc = matched["crtc_id"]
+            cur_fb = matched["fb_id"]
+            stall_sec = time.time() - self.last_capture_ts
+
+            # Fall 1: CRTC-ID hat sich beim Login/Session-Wechsel geändert
+            # Fall 2: Monitor war kurz auf fb_id=0 (Modeset beim Login) und ist wieder da
+            # Fall 3: ffmpeg liefert seit > 1.0s keine Frames mehr oder Prozess hat sich beendet
+            proc_dead = (self.proc is not None and self.proc.poll() is not None)
+            need_restart = False
+
+            if last_crtc_id is not None and cur_crtc != last_crtc_id:
+                need_restart = True
+            elif zero_fb_seen and cur_fb != 0:
+                need_restart = True
+                zero_fb_seen = False
+            elif cur_fb == 0:
+                zero_fb_seen = True
+            elif proc_dead or stall_sec > 1.2:
+                need_restart = True
+
+            # Auch prüfen, ob sich der Framebuffer nach Tastatureingabe geändert hat,
+            # während kmsgrab noch am alten Buffer hing
+            if last_fb_id is not None and cur_fb != 0 and cur_fb != last_fb_id and stall_sec > 0.45:
+                need_restart = True
+
+            last_crtc_id = cur_crtc
+            if cur_fb != 0:
+                last_fb_id = cur_fb
+
+            if need_restart and cur_fb != 0:
+                cur_mon["crtc_id"] = cur_crtc
+                cur_mon["width"] = matched["width"]
+                cur_mon["height"] = matched["height"]
+                self.last_capture_ts = time.time()
+                self.start_stream(mon_index=cur_mon["index"], force_restart=True)
+
+
+def main():
+    uinput = UInputController()
+    time.sleep(0.15)
+    card_path, monitors, total_w, total_h = discover_drm_monitors(uinput=uinput)
+    if not monitors:
+        uinput.close()
+        send_json({"type": "error", "message": "Keine aktiven Monitore über DRM/KMS gefunden."})
+        sys.exit(1)
+
+    m0 = monitors[0]
+    uinput.move_abs(m0["x"] + m0["width"] / 2, m0["y"] + m0["height"] / 2, total_w, total_h)
+
+    send_json({
+        "type": "init",
+        "card": card_path,
+        "monitors": monitors,
+        "total_width": total_w,
+        "total_height": total_h
+    })
+
+    streamer = StreamWorker(card_path, monitors, total_w, total_h, uinput=uinput)
+    streamer.start_stream(mon_index=1, fps=25, scale_pct=75, quality=80, force_restart=True)
+
+    def keep_awake_worker():
+        while True:
+            time.sleep(25)
+            wake_screens()
+
+    threading.Thread(target=keep_awake_worker, daemon=True).start()
+
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+
+            mtype = msg.get("t")
+            if mtype == "ack":
+                streamer.on_client_ack()
+                continue
+
+            cur_mon = streamer.current_mon or monitors[0]
+
+            if mtype == "m":
+                rx = float(msg.get("x", 0.5))
+                ry = float(msg.get("y", 0.5))
+                gx = cur_mon["x"] + rx * cur_mon["width"]
+                gy = cur_mon["y"] + ry * cur_mon["height"]
+                uinput.move_abs(gx, gy, streamer.total_w, streamer.total_h)
+
+            elif mtype == "b":
+                btn_map = {1: BTN_LEFT, 2: BTN_RIGHT, 3: BTN_MIDDLE, 4: BTN_SIDE, 5: BTN_EXTRA}
+                bcode = btn_map.get(int(msg.get("b", 1)), BTN_LEFT)
+                pressed = bool(msg.get("p", False))
+                if "x" in msg and "y" in msg:
+                    gx = cur_mon["x"] + float(msg["x"]) * cur_mon["width"]
+                    gy = cur_mon["y"] + float(msg["y"]) * cur_mon["height"]
+                    uinput.move_abs(gx, gy, streamer.total_w, streamer.total_h)
+                uinput.button(bcode, pressed)
+                streamer.notify_user_input()
+
+            elif mtype == "w":
+                uinput.wheel(int(msg.get("dy", 0)), int(msg.get("dx", 0)))
+                streamer.notify_user_input()
+
+            elif mtype == "k":
+                kcode = int(msg.get("c", 0))
+                pressed = bool(msg.get("p", False))
+                uinput.key(kcode, pressed)
+                streamer.notify_user_input()
+                # Nach Enter / Return (Keycode 28 oder Numpad-Enter 96) beim Login nach 0.35s Stream auffrischen
+                if not pressed and kcode in (28, 96):
+                    def refresh_after_enter():
+                        time.sleep(0.35)
+                        streamer.notify_user_input()
+                    threading.Thread(target=refresh_after_enter, daemon=True).start()
+
+            elif mtype == "cfg":
+                streamer.start_stream(
+                    mon_index=msg.get("mon"),
+                    fps=msg.get("fps"),
+                    scale_pct=msg.get("scale"),
+                    quality=msg.get("quality")
+                )
+
+            elif mtype == "wake":
+                wake_screens(uinput)
+                _, new_mons, tw, th = discover_drm_monitors(uinput=uinput)
+                if new_mons:
+                    streamer.monitors = new_mons
+                    streamer.total_w = tw
+                    streamer.total_h = th
+                streamer.start_stream()
+
+            elif mtype == "quit":
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        streamer._stop_current()
+        uinput.close()
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def load_station_configs() -> list:
+    """
+    Lädt alle einzelnen Maschinen-Konfigurationsdateien (*.json) aus ~/.config/lanview/stations/.
+    Keine fest codierten Stationen im Programmcode!
+    """
+    stations = []
+    if not os.path.isdir(STATIONS_CONFIG_DIR):
+        return stations
+
+    for fname in sorted(os.listdir(STATIONS_CONFIG_DIR)):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(STATIONS_CONFIG_DIR, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            st_id = str(data.get("id") or os.path.splitext(fname)[0]).strip()
+            host = str(data.get("host") or st_id).strip()
+            ip = str(data.get("ip") or "").strip()
+            name = str(data.get("name") or st_id.upper()).strip()
+            desc = str(data.get("description") or "").strip()
+            user = str(data.get("user") or "").strip()
+            ssh_key = str(data.get("ssh_key") or "").strip()
+            sudo_pass = str(data.get("sudo_pass") or "")
+            default_fps = int(data.get("default_fps") or 30)
+            raw_scale = data.get("default_scale", 100)
+            if isinstance(raw_scale, float) and raw_scale <= 1.0:
+                default_scale = int(round(raw_scale * 100))
+            else:
+                default_scale = int(raw_scale)
+
+            stations.append({
+                "id": st_id,
+                "name": name,
+                "description": desc,
+                "host": host,
+                "ip": ip,
+                "user": user,
+                "ssh_key": ssh_key,
+                "sudo_pass": sudo_pass,
+                "default_fps": default_fps,
+                "default_scale": default_scale,
+                "config_file": fpath,
+                "config_filename": fname,
+            })
+        except Exception:
+            continue
+
+    def natural_key(st):
+        m = re.match(r"^([a-zA-Z]+)(\d+)$", st["id"])
+        if m:
+            return (0, m.group(1).lower(), int(m.group(2)))
+        return (1, st["id"].lower(), 0)
+
+    return sorted(stations, key=natural_key)
+
+
+class SSHStreamThread(QThread):
+    frame_received = pyqtSignal(int, QImage, int)  # (mon_index, image, byte_len)
+    init_received = pyqtSignal(dict)
+    status_received = pyqtSignal(str)
+    error_received = pyqtSignal(str)
+    disconnected = pyqtSignal()
+
+    def __init__(self, target_host: str, sudo_pass: str = "", user: str = "", ssh_key: str = ""):
+        super().__init__()
+        self.target_host = target_host
+        self.sudo_pass = sudo_pass
+        self.user = user
+        self.ssh_key = os.path.expanduser(ssh_key) if ssh_key else ""
+        self.proc = None
+        self.running = True
+        self.write_lock = threading.Lock()
+
+    def run(self):
+        self.status_received.emit(f"Verbinde per SSH mit {self.target_host} ...")
+        compressed = zlib.compress(REMOTE_AGENT_CODE.encode("utf-8"), 9)
+        b64_agent = base64.b64encode(compressed).decode("ascii")
+        py_exec = f"import base64,zlib; exec(zlib.decompress(base64.b64decode('{b64_agent}')).decode('utf-8'))"
+        q_py = shlex.quote(py_exec)
+        q_pw = shlex.quote(self.sudo_pass)
+
+        remote_cmd = (
+            f"PY_CODE={q_py}; "
+            f"if [ \"$(id -u)\" -eq 0 ]; then "
+            f"  exec python3 -u -c \"$PY_CODE\"; "
+            f"elif sudo -n true 2>/dev/null; then "
+            f"  exec sudo -E python3 -u -c \"$PY_CODE\"; "
+            f"else "
+            f"  (printf '%s\\n' {q_pw}; cat) | sudo -S -p '' -E python3 -u -c \"$PY_CODE\"; "
+            f"fi"
+        )
+
+        ssh_cmd = [
+            "ssh",
+            "-o", "ConnectTimeout=8",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "Compression=no",
+        ]
+        if self.ssh_key and os.path.isfile(self.ssh_key):
+            ssh_cmd.extend(["-i", self.ssh_key])
+        if self.user and "@" not in self.target_host:
+            ssh_cmd.extend(["-l", self.user])
+        ssh_cmd.extend([self.target_host, remote_cmd])
+
+        try:
+            self.proc = subprocess.Popen(
+                ssh_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+        except Exception as e:
+            self.error_received.emit(f"SSH konnte nicht gestartet werden: {e}")
+            self.disconnected.emit()
+            return
+
+        stderr_lines = []
+        def read_stderr():
+            try:
+                for line in self.proc.stderr:
+                    txt = line.decode("utf-8", errors="replace").strip()
+                    if txt:
+                        stderr_lines.append(txt)
+            except Exception:
+                pass
+
+        threading.Thread(target=read_stderr, daemon=True).start()
+
+        stdout = self.proc.stdout
+        try:
+            while self.running:
+                hdr = self._read_exact(stdout, 8)
+                if not hdr:
+                    break
+                magic = hdr[:4]
+                length = struct.unpack(">I", hdr[4:8])[0]
+                if length > 25_000_000 or length < 1:
+                    break
+                payload = self._read_exact(stdout, length)
+                if not payload:
+                    break
+
+                if magic == b"LVFR":
+                    # Sofort ACK zurückschicken, damit der Server den nächsten Frame frei hat
+                    self.send_cmd({"t": "ack"})
+                    mon_idx = payload[0]
+                    jpeg_data = payload[1:]
+                    img = QImage.fromData(jpeg_data, "JPEG")
+                    if not img.isNull():
+                        self.frame_received.emit(mon_idx, img, len(jpeg_data))
+                elif magic == b"LVJS":
+                    try:
+                        msg = json.loads(payload.decode("utf-8", errors="replace"))
+                        mtype = msg.get("type")
+                        if mtype == "init":
+                            self.init_received.emit(msg)
+                        elif mtype == "error":
+                            self.error_received.emit(msg.get("message", "Unbekannter Remote-Fehler"))
+                    except Exception:
+                        pass
+        except Exception as e:
+            if self.running:
+                self.error_received.emit(f"Stream-Verbindungsfehler: {e}")
+        finally:
+            self.stop()
+            if stderr_lines and self.running:
+                err_tail = "\n".join(stderr_lines[-5:])
+                if "password" not in err_tail.lower():
+                    self.status_received.emit(f"Beendet ({err_tail})")
+            self.disconnected.emit()
+
+    def _read_exact(self, stream, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n and self.running:
+            chunk = stream.read(n - len(buf))
+            if not chunk:
+                return b""
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def send_cmd(self, obj: dict):
+        if not self.proc or not self.proc.stdin or not self.running:
+            return
+        try:
+            line = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
+            with self.write_lock:
+                self.proc.stdin.write(line)
+                self.proc.stdin.flush()
+        except Exception:
+            pass
+
+    def stop(self):
+        self.running = False
+        if self.proc:
+            try:
+                self.send_cmd({"t": "quit"})
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+            self.proc = None
+
+
+class VideoCanvas(QWidget):
+    """Zeigt das Live-Bild des gewählten Monitors inkl. Ladeanimation beim Monitorwechsel."""
+
+    def __init__(self, parent_win):
+        super().__init__(parent_win)
+        self.parent_win = parent_win
+        self.current_image = None
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setStyleSheet("background-color: #0f172a;")
+        self._last_move_sent = 0.0
+
+        # Ladeanimation (Spinner) für Verbindungsaufbau & Monitorwechsel
+        self.loading_active = False
+        self.loading_text = ""
+        self.spinner_angle = 0
+        self.spinner_timer = QTimer(self)
+        self.spinner_timer.timeout.connect(self._tick_spinner)
+
+    def start_loading(self, text: str):
+        self.loading_active = True
+        self.loading_text = text
+        self.spinner_angle = 0
+        if not self.spinner_timer.isActive():
+            self.spinner_timer.start(30)
+        self.update()
+
+    def stop_loading(self):
+        if self.loading_active:
+            self.loading_active = False
+            self.spinner_timer.stop()
+            self.update()
+
+    def _tick_spinner(self):
+        self.spinner_angle = (self.spinner_angle + 18) % 360
+        self.update()
+
+    def update_frame(self, img: QImage):
+        self.current_image = img
+        if self.loading_active:
+            self.stop_loading()
+        else:
+            self.update()
+
+    def clear_frame(self):
+        self.current_image = None
+        self.stop_loading()
+        self.update()
+
+    def _get_target_rect(self):
+        if not self.current_image or self.current_image.isNull():
+            return None
+        ww, wh = self.width(), self.height()
+        iw, ih = self.current_image.width(), self.current_image.height()
+        if ww <= 0 or wh <= 0 or iw <= 0 or ih <= 0:
+            return None
+        scale = min(ww / iw, wh / ih)
+        tw, th = int(iw * scale), int(ih * scale)
+        tx = (ww - tw) // 2
+        ty = (wh - th) // 2
+        return (tx, ty, tw, th)
+
+    def _map_pos_to_normalized(self, pos):
+        rect = self._get_target_rect()
+        if not rect:
+            return None
+        tx, ty, tw, th = rect
+        if tw <= 0 or th <= 0:
+            return None
+        rx = (pos.x() - tx) / tw
+        ry = (pos.y() - ty) / th
+        rx = max(0.0, min(1.0, rx))
+        ry = max(0.0, min(1.0, ry))
+        return rx, ry
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.fillRect(self.rect(), QColor("#0f172a"))
+
+        if self.current_image and not self.current_image.isNull():
+            rect = self._get_target_rect()
+            if rect:
+                tx, ty, tw, th = rect
+                painter.drawImage(tx, ty, self.current_image.scaled(
+                    tw, th, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation
+                ))
+        elif not self.loading_active:
+            painter.setPen(QColor("#94a3b8"))
+            font = QFont("Sans Serif", 13)
+            painter.setFont(font)
+            painter.drawText(
+                self.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                "Keine aktive Verbindung.\nWähle oben eine Station oder IP-Adresse und klicke auf 'Verbinden'."
+            )
+
+        # Lade-Overlay mit animiertem Dreh-Spinner bei Monitorwechsel / Verbindungsaufbau
+        if self.loading_active:
+            painter.fillRect(self.rect(), QColor(15, 23, 42, 175))
+            cx = self.width() / 2.0
+            cy = self.height() / 2.0 - 18.0
+            radius = 26.0
+
+            # Hintergrund-Ring
+            bg_pen = QPen(QColor(71, 85, 105, 120), 4.5)
+            painter.setPen(bg_pen)
+            painter.drawEllipse(QRectF(cx - radius, cy - radius, radius * 2, radius * 2))
+
+            # Rotierender Bogen
+            arc_pen = QPen(QColor("#f59e0b"), 4.5)
+            arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(arc_pen)
+            painter.drawArc(
+                QRectF(cx - radius, cy - radius, radius * 2, radius * 2),
+                int(-self.spinner_angle * 16),
+                int(110 * 16)
+            )
+
+            # Text unter dem Spinner
+            painter.setPen(QColor("#f8fafc"))
+            font = QFont("Sans Serif", 12, QFont.Weight.Bold)
+            painter.setFont(font)
+            text_rect = QRectF(0, cy + radius + 14, self.width(), 40)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, self.loading_text)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if not self.parent_win.is_control_enabled():
+            return
+        coords = self._map_pos_to_normalized(event.position())
+        if not coords:
+            return
+        now = time.time()
+        if now - self._last_move_sent >= 0.012:
+            self._last_move_sent = now
+            self.parent_win.send_mouse_move(coords[0], coords[1])
+
+    def mousePressEvent(self, event: QMouseEvent):
+        self.setFocus()
+        if not self.parent_win.is_control_enabled():
+            return
+        coords = self._map_pos_to_normalized(event.position())
+        btn = self._qt_btn_to_code(event.button())
+        if btn and coords:
+            self.parent_win.send_mouse_button(btn, True, coords[0], coords[1])
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if not self.parent_win.is_control_enabled():
+            return
+        coords = self._map_pos_to_normalized(event.position())
+        btn = self._qt_btn_to_code(event.button())
+        if btn and coords:
+            self.parent_win.send_mouse_button(btn, False, coords[0], coords[1])
+
+    def wheelEvent(self, event: QWheelEvent):
+        if not self.parent_win.is_control_enabled():
+            return
+        delta_y = event.angleDelta().y()
+        delta_x = event.angleDelta().x()
+        dy = 1 if delta_y > 0 else (-1 if delta_y < 0 else 0)
+        dx = 1 if delta_x > 0 else (-1 if delta_x < 0 else 0)
+        if dy or dx:
+            self.parent_win.send_mouse_wheel(dy, dx)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_F and (event.modifiers() & Qt.KeyboardModifier.ControlModifier) and (event.modifiers() & Qt.KeyboardModifier.AltModifier):
+            self.parent_win.toggle_fullscreen()
+            event.accept()
+            return
+
+        if not self.parent_win.is_control_enabled():
+            return
+        if event.isAutoRepeat():
+            return
+        evdev_code = event.nativeScanCode() - 8
+        if 1 <= evdev_code <= 247:
+            self.parent_win.send_key(evdev_code, True)
+            event.accept()
+
+    def keyReleaseEvent(self, event: QKeyEvent):
+        if not self.parent_win.is_control_enabled():
+            return
+        if event.isAutoRepeat():
+            return
+        evdev_code = event.nativeScanCode() - 8
+        if 1 <= evdev_code <= 247:
+            self.parent_win.send_key(evdev_code, False)
+            event.accept()
+
+    @staticmethod
+    def _qt_btn_to_code(btn):
+        if btn == Qt.MouseButton.LeftButton:
+            return 1
+        if btn == Qt.MouseButton.RightButton:
+            return 2
+        if btn == Qt.MouseButton.MiddleButton:
+            return 3
+        if btn == Qt.MouseButton.BackButton:
+            return 4
+        if btn == Qt.MouseButton.ForwardButton:
+            return 5
+        return 0
+
+
+class StationCard(QFrame):
+    """Klickbare Auswahlkarte für eine Maschine aus ~/.config/lanview/stations/*.json."""
+
+    def __init__(self, station: dict, on_select, parent=None):
+        super().__init__(parent)
+        self.station = station
+        self.on_select = on_select
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setObjectName("StationCard")
+        self.setStyleSheet("""
+            QFrame#StationCard {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 10px;
+            }
+            QFrame#StationCard:hover {
+                background-color: #26354d;
+                border: 1px solid #3b82f6;
+            }
+        """)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(16)
+
+        badge = QLabel(station["id"].upper(), self)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFixedSize(64, 48)
+        badge.setStyleSheet("""
+            background-color: #0f172a;
+            color: #38bdf8;
+            border: 1px solid #0284c7;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 800;
+        """)
+        layout.addWidget(badge)
+
+        info_col = QVBoxLayout()
+        info_col.setSpacing(4)
+
+        title_lbl = QLabel(station["name"], self)
+        title_lbl.setStyleSheet("color: #f8fafc; font-size: 15px; font-weight: 700; border: none; background: transparent;")
+        info_col.addWidget(title_lbl)
+
+        desc_text = station["description"] or f"Host: {station['host']}"
+        desc_lbl = QLabel(desc_text, self)
+        desc_lbl.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 500; border: none; background: transparent;")
+        info_col.addWidget(desc_lbl)
+
+        meta_parts = [f"Host: {station['host']}"]
+        if station.get("ip"):
+            meta_parts.append(f"IP: {station['ip']}")
+        if station.get("user"):
+            meta_parts.append(f"User: {station['user']}")
+        meta_parts.append(f"Config: {station['config_filename']}")
+        meta_lbl = QLabel("  •  ".join(meta_parts), self)
+        meta_lbl.setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+        info_col.addWidget(meta_lbl)
+
+        layout.addLayout(info_col, 1)
+
+        conn_btn = QPushButton("Verbinden →", self)
+        conn_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        conn_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2563eb;
+                color: #ffffff;
+                border: 1px solid #1d4ed8;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+        """)
+        conn_btn.clicked.connect(lambda: self.on_select(self.station))
+        layout.addWidget(conn_btn)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.on_select(self.station)
+        super().mousePressEvent(event)
+
+
+class LanViewWindow(QMainWindow):
+    def __init__(self, initial_host=None, sudo_pass=""):
+        super().__init__()
+        self.setWindowTitle("LanView – Direct-IP / SSH Wayland Remote Desktop")
+        self.resize(1360, 820)
+        self.default_sudo_pass = sudo_pass
+        self.stations = []
+        self.station_map = {}
+        self.stream_thread = None
+        self.monitors = []
+        self.current_mon_index = 1
+
+        self.frame_count = 0
+        self.byte_count = 0
+
+        self._build_ui()
+        self.reload_stations()
+
+        self.stats_timer = QTimer(self)
+        self.stats_timer.timeout.connect(self._update_stats)
+        self.stats_timer.start(1000)
+
+        if initial_host:
+            self._select_and_connect_host(initial_host)
+
+    def _build_ui(self):
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        vbox = QVBoxLayout(central)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+
+        toolbar = QFrame(self)
+        toolbar.setStyleSheet("""
+            QFrame {
+                background-color: #1e293b;
+                border-bottom: 1px solid #334155;
+            }
+            QLabel {
+                color: #e2e8f0;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QComboBox {
+                background-color: #0f172a;
+                color: #f8fafc;
+                border: 1px solid #475569;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+                min-height: 24px;
+            }
+            QPushButton {
+                background-color: #334155;
+                color: #f8fafc;
+                border: 1px solid #475569;
+                border-radius: 4px;
+                padding: 5px 12px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #475569;
+            }
+            QCheckBox {
+                color: #e2e8f0;
+                font-size: 12px;
+                font-weight: 600;
+            }
+        """)
+        tb_layout = QHBoxLayout(toolbar)
+        tb_layout.setContentsMargins(10, 6, 10, 6)
+        tb_layout.setSpacing(8)
+
+        self.back_to_list_btn = QPushButton("☰ Maschinen", self)
+        self.back_to_list_btn.setToolTip("Zurück zur Maschinen-Auswahl")
+        self.back_to_list_btn.clicked.connect(self._show_station_selector)
+        tb_layout.addWidget(self.back_to_list_btn)
+
+        tb_layout.addWidget(QLabel("Maschine:"))
+        self.host_combo = QComboBox(self)
+        self.host_combo.setEditable(True)
+        self.host_combo.setMinimumWidth(220)
+        tb_layout.addWidget(self.host_combo)
+
+        self.connect_btn = QPushButton("Verbinden", self)
+        self.connect_btn.setStyleSheet("background-color: #2563eb; border-color: #1d4ed8;")
+        self.connect_btn.clicked.connect(self.toggle_connection)
+        tb_layout.addWidget(self.connect_btn)
+
+        tb_layout.addSpacing(10)
+
+        tb_layout.addWidget(QLabel("Bildschirm:"))
+        self.mon_btn_container = QWidget(self)
+        self.mon_btn_layout = QHBoxLayout(self.mon_btn_container)
+        self.mon_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self.mon_btn_layout.setSpacing(4)
+        tb_layout.addWidget(self.mon_btn_container)
+
+        self.mon_combo = QComboBox(self)
+        self.mon_combo.setMinimumWidth(210)
+        self.mon_combo.addItem("Wird beim Verbinden geladen", 1)
+        self.mon_combo.currentIndexChanged.connect(self._on_monitor_combo_changed)
+        tb_layout.addWidget(self.mon_combo)
+
+        tb_layout.addSpacing(10)
+
+        tb_layout.addWidget(QLabel("Qualität:"))
+        self.scale_combo = QComboBox(self)
+        self.scale_combo.addItem("100% (Nativ 1080p)", 100)
+        self.scale_combo.addItem("75% (Schnell)", 75)
+        self.scale_combo.addItem("50% (Kompakt)", 50)
+        self.scale_combo.currentIndexChanged.connect(self._send_stream_config)
+        tb_layout.addWidget(self.scale_combo)
+
+        self.fps_combo = QComboBox(self)
+        self.fps_combo.addItem("30 FPS", 30)
+        self.fps_combo.addItem("25 FPS", 25)
+        self.fps_combo.addItem("60 FPS", 60)
+        self.fps_combo.addItem("15 FPS", 15)
+        self.fps_combo.currentIndexChanged.connect(self._send_stream_config)
+        tb_layout.addWidget(self.fps_combo)
+
+        tb_layout.addSpacing(8)
+
+        self.ctrl_checkbox = QCheckBox("Maus & Tastatur aktiv", self)
+        self.ctrl_checkbox.setChecked(True)
+        tb_layout.addWidget(self.ctrl_checkbox)
+
+        tb_layout.addStretch(1)
+
+        self.wake_btn = QPushButton("⚡ Aufwecken / Refresh", self)
+        self.wake_btn.setToolTip("Weckt Monitore auf und aktualisiert den Video-Stream")
+        self.wake_btn.clicked.connect(self._on_wake_clicked)
+        tb_layout.addWidget(self.wake_btn)
+
+        self.fs_btn = QPushButton("⛶ Vollbild", self)
+        self.fs_btn.setToolTip("Vollbildmodus umschalten (Strg+Alt+F)")
+        self.fs_btn.clicked.connect(self.toggle_fullscreen)
+        tb_layout.addWidget(self.fs_btn)
+
+        vbox.addWidget(toolbar)
+
+        # Zentraler Stack: Seite 0 = Maschinen-Auswahl, Seite 1 = Live-Remote-Canvas
+        self.stack = QStackedWidget(self)
+        self.selector_page = self._build_selector_page()
+        self.canvas = VideoCanvas(self)
+        self.stack.addWidget(self.selector_page)
+        self.stack.addWidget(self.canvas)
+        self.stack.setCurrentWidget(self.selector_page)
+        vbox.addWidget(self.stack, 1)
+
+        self.status_bar = QStatusBar(self)
+        self.status_bar.setStyleSheet("background-color: #0f172a; color: #94a3b8; font-size: 11px;")
+        self.setStatusBar(self.status_bar)
+        self.status_label = QLabel("Bereit – Bitte wähle eine Maschine aus.")
+        self.stats_label = QLabel("")
+        self.status_bar.addWidget(self.status_label, 1)
+        self.status_bar.addPermanentWidget(self.stats_label)
+
+    def _build_selector_page(self) -> QWidget:
+        page = QWidget(self)
+        page.setStyleSheet("background-color: #0f172a;")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(40, 32, 40, 32)
+        outer.setSpacing(18)
+
+        header_row = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(4)
+
+        h1 = QLabel("Maschine auswählen", page)
+        h1.setStyleSheet("color: #f8fafc; font-size: 22px; font-weight: 800;")
+        title_col.addWidget(h1)
+
+        sub = QLabel(
+            f"Jede Station wird als eigene Konfigurationsdatei aus {STATIONS_CONFIG_DIR} (*.json) geladen:",
+            page
+        )
+        sub.setStyleSheet("color: #94a3b8; font-size: 13px;")
+        title_col.addWidget(sub)
+        header_row.addLayout(title_col, 1)
+
+        reload_btn = QPushButton("↻ Configs neu laden", page)
+        reload_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reload_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #e2e8f0;
+                border: 1px solid #475569;
+                border-radius: 6px;
+                padding: 8px 14px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+            }
+        """)
+        reload_btn.clicked.connect(self.reload_stations)
+        header_row.addWidget(reload_btn, 0, Qt.AlignmentFlag.AlignTop)
+        outer.addLayout(header_row)
+
+        scroll = QScrollArea(page)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background-color: transparent; border: none; }")
+
+        self.cards_container = QWidget(scroll)
+        self.cards_container.setStyleSheet("background-color: transparent;")
+        self.cards_layout = QVBoxLayout(self.cards_container)
+        self.cards_layout.setContentsMargins(0, 4, 0, 4)
+        self.cards_layout.setSpacing(12)
+        self.cards_layout.addStretch(1)
+
+        scroll.setWidget(self.cards_container)
+        outer.addWidget(scroll, 1)
+        return page
+
+    def reload_stations(self):
+        self.stations = load_station_configs()
+        self.station_map = {}
+
+        # Dropdown aktualisieren
+        current_txt = self.host_combo.currentText().strip()
+        self.host_combo.blockSignals(True)
+        self.host_combo.clear()
+        self.host_combo.addItem("— Bitte Maschine wählen —", "")
+        for st in self.stations:
+            self.station_map[st["id"].lower()] = st
+            self.station_map[st["host"].lower()] = st
+            if st.get("ip"):
+                self.station_map[st["ip"].lower()] = st
+            label = f"{st['id'].upper()} – {st['name']}"
+            if st.get("ip"):
+                label += f" ({st['ip']})"
+            self.host_combo.addItem(label, st["id"])
+        self.host_combo.setCurrentIndex(0)
+        if current_txt and not current_txt.startswith("—"):
+            self._set_combo_to_host(current_txt)
+        self.host_combo.blockSignals(False)
+
+        # Karten-Liste im Auswahlbildschirm aktualisieren
+        while self.cards_layout.count():
+            item = self.cards_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self.stations:
+            empty_lbl = QLabel(
+                f"Keine Konfigurationsdateien in {STATIONS_CONFIG_DIR} gefunden.\n"
+                f"Erstelle dort z. B. ws1.json bis ws5.json.",
+                self.cards_container
+            )
+            empty_lbl.setStyleSheet("color: #f87171; font-size: 14px; padding: 20px;")
+            self.cards_layout.addWidget(empty_lbl)
+        else:
+            for st in self.stations:
+                card = StationCard(st, on_select=self.connect_to_station, parent=self.cards_container)
+                self.cards_layout.addWidget(card)
+
+        self.cards_layout.addStretch(1)
+        if not (self.stream_thread and self.stream_thread.isRunning()):
+            self.status_label.setText(
+                f"{len(self.stations)} Maschinen-Konfiguration(en) aus {STATIONS_CONFIG_DIR} geladen. Bitte Maschine auswählen."
+            )
+
+    def _set_combo_to_host(self, host_or_id: str):
+        key = host_or_id.strip().lower()
+        for i in range(self.host_combo.count()):
+            data = str(self.host_combo.itemData(i) or "").lower()
+            if data and data == key:
+                self.host_combo.setCurrentIndex(i)
+                return
+        st = self.station_map.get(key)
+        if st:
+            for i in range(self.host_combo.count()):
+                if str(self.host_combo.itemData(i) or "").lower() == st["id"].lower():
+                    self.host_combo.setCurrentIndex(i)
+                    return
+        self.host_combo.setCurrentText(host_or_id)
+
+    def _select_and_connect_host(self, host_or_id: str):
+        key = host_or_id.strip().lower()
+        st = self.station_map.get(key)
+        if st:
+            self.connect_to_station(st)
+        else:
+            self._set_combo_to_host(host_or_id)
+            QTimer.singleShot(100, self.toggle_connection)
+
+    def _show_station_selector(self):
+        if self.stream_thread and self.stream_thread.isRunning():
+            self.stream_thread.stop()
+        self.stack.setCurrentWidget(self.selector_page)
+
+    def connect_to_station(self, station: dict):
+        if self.stream_thread and self.stream_thread.isRunning():
+            self.stream_thread.stop()
+            self.stream_thread.wait(800)
+
+        self._set_combo_to_host(station["id"])
+
+        # Standard-FPS und Skalierung aus der Stations-Config übernehmen
+        fps_val = station.get("default_fps", 30)
+        for i in range(self.fps_combo.count()):
+            if self.fps_combo.itemData(i) == fps_val:
+                self.fps_combo.blockSignals(True)
+                self.fps_combo.setCurrentIndex(i)
+                self.fps_combo.blockSignals(False)
+                break
+
+        scale_val = station.get("default_scale", 100)
+        for i in range(self.scale_combo.count()):
+            if self.scale_combo.itemData(i) == scale_val:
+                self.scale_combo.blockSignals(True)
+                self.scale_combo.setCurrentIndex(i)
+                self.scale_combo.blockSignals(False)
+                break
+
+        self._start_connection(
+            target=station.get("ip") or station["host"],
+            display_name=station["name"],
+            sudo_pass=station.get("sudo_pass") or self.default_sudo_pass,
+            user=station.get("user") or "",
+            ssh_key=station.get("ssh_key") or ""
+        )
+
+    def _resolve_selected_station_or_host(self):
+        idx = self.host_combo.currentIndex()
+        data_id = str(self.host_combo.itemData(idx) or "").strip().lower()
+        txt = self.host_combo.currentText().strip()
+        if txt.startswith("—"):
+            return None, ""
+
+        # Prüfen, ob der Text dem Item-Text des gewählten Eintrags entspricht
+        if idx > 0 and data_id in self.station_map and txt == self.host_combo.itemText(idx):
+            st = self.station_map[data_id]
+            return st, st["host"]
+
+        # Freitext-Eingabe prüfen
+        clean = txt.split("(", 1)[0].strip()
+        if "–" in clean:
+            clean = clean.split("–", 1)[0].strip()
+        st = self.station_map.get(clean.lower())
+        if st:
+            return st, st["host"]
+        return None, clean
+
+    def toggle_connection(self):
+        if self.stream_thread and self.stream_thread.isRunning():
+            self.stream_thread.stop()
+            return
+
+        st, target = self._resolve_selected_station_or_host()
+        if st:
+            self.connect_to_station(st)
+            return
+
+        if not target:
+            self.stack.setCurrentWidget(self.selector_page)
+            QMessageBox.information(
+                self,
+                "Maschine auswählen",
+                "Bitte wähle zuerst eine Maschine (WS1–WS5) aus der Übersicht oder im Dropdown aus."
+            )
+            return
+
+        self._start_connection(
+            target=target,
+            display_name=target,
+            sudo_pass=self.default_sudo_pass
+        )
+
+    def _start_connection(self, target: str, display_name: str, sudo_pass: str, user: str = "", ssh_key: str = ""):
+        self.active_display_name = display_name
+        self.connect_btn.setText("Trennen")
+        self.connect_btn.setStyleSheet("background-color: #dc2626; border-color: #b91c1c;")
+        self.host_combo.setEnabled(False)
+
+        self.stack.setCurrentWidget(self.canvas)
+        self.canvas.start_loading(f"Verbinde mit {display_name} ...")
+
+        self.stream_thread = SSHStreamThread(
+            target,
+            sudo_pass=sudo_pass,
+            user=user,
+            ssh_key=ssh_key
+        )
+        self.stream_thread.frame_received.connect(self._on_frame)
+        self.stream_thread.init_received.connect(self._on_init)
+        self.stream_thread.status_received.connect(self._on_status)
+        self.stream_thread.error_received.connect(self._on_error)
+        self.stream_thread.disconnected.connect(self._on_disconnected)
+        self.stream_thread.start()
+        self.canvas.setFocus()
+
+    def _on_init(self, info: dict):
+        self.monitors = info.get("monitors", [])
+        tw = info.get("total_width", 0)
+        th = info.get("total_height", 0)
+
+        self.mon_combo.blockSignals(True)
+        self.mon_combo.clear()
+
+        while self.mon_btn_layout.count():
+            item = self.mon_btn_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self.mon_buttons = {}
+        for m in self.monitors:
+            idx = m["index"]
+            self.mon_combo.addItem(m["label"], idx)
+            btn = QPushButton(f"M{idx} ({m['name']})", self)
+            btn.setCheckable(True)
+            btn.setChecked(idx == 1)
+            btn.clicked.connect(lambda checked, i=idx: self.select_monitor(i))
+            self.mon_btn_layout.addWidget(btn)
+            self.mon_buttons[idx] = btn
+
+        self.mon_combo.blockSignals(False)
+        self.current_mon_index = 1
+        self._highlight_mon_button(1)
+        if self.monitors:
+            self.canvas.start_loading(f"Lade {self.monitors[0]['label']} ...")
+        # Gewünschte FPS & Skalierung der gewählten Station anwenden
+        self._send_stream_config()
+        disp = getattr(self, "active_display_name", "Remote-Host")
+        self.status_label.setText(
+            f"Verbunden mit {disp} | {len(self.monitors)} Monitor(e) erkannt (Gesamtfläche: {tw}x{th})"
+        )
+
+    def _highlight_mon_button(self, active_idx: int):
+        if not hasattr(self, "mon_buttons"):
+            return
+        for idx, btn in self.mon_buttons.items():
+            btn.blockSignals(True)
+            btn.setChecked(idx == active_idx)
+            if idx == active_idx:
+                btn.setStyleSheet("background-color: #f59e0b; color: #0f172a; border-color: #d97706;")
+            else:
+                btn.setStyleSheet("")
+            btn.blockSignals(False)
+
+    def select_monitor(self, mon_index: int):
+        if mon_index == self.current_mon_index and not self.canvas.loading_active:
+            self.canvas.setFocus()
+            return
+        self.current_mon_index = mon_index
+        self._highlight_mon_button(mon_index)
+        self.mon_combo.blockSignals(True)
+        for i in range(self.mon_combo.count()):
+            if self.mon_combo.itemData(i) == mon_index:
+                self.mon_combo.setCurrentIndex(i)
+                break
+        self.mon_combo.blockSignals(False)
+
+        mon_name = f"Monitor {mon_index}"
+        for m in self.monitors:
+            if m["index"] == mon_index:
+                mon_name = f"Monitor {mon_index} ({m['name']})"
+                break
+        self.canvas.start_loading(f"Wechsle auf {mon_name} ...")
+        self._send_stream_config()
+        self.canvas.setFocus()
+
+    def _on_monitor_combo_changed(self, idx: int):
+        mon_index = self.mon_combo.currentData()
+        if mon_index:
+            self.select_monitor(int(mon_index))
+
+    def _send_stream_config(self):
+        if not self.stream_thread or not self.stream_thread.isRunning():
+            return
+        fps = int(self.fps_combo.currentData() or 30)
+        scale = int(self.scale_combo.currentData() or 100)
+        self.stream_thread.send_cmd({
+            "t": "cfg",
+            "mon": self.current_mon_index,
+            "fps": fps,
+            "scale": scale,
+            "quality": 80
+        })
+
+    def _on_wake_clicked(self):
+        if self.stream_thread and self.stream_thread.isRunning():
+            self.canvas.start_loading("Wecke Bildschirme auf & aktualisiere Stream ...")
+            self.stream_thread.send_cmd({"t": "wake"})
+            self.status_label.setText("Aufweck- & Refresh-Signal an Ziel-PC gesendet...")
+        self.canvas.setFocus()
+
+    def _on_frame(self, mon_idx: int, img: QImage, byte_len: int):
+        # Beim Monitorwechsel verwerfen wir evtl. noch unterwegs gewesene Frames des alten Monitors,
+        # damit die Ladeanimation exakt beim ersten Frame des neuen Monitors endet!
+        if mon_idx != self.current_mon_index:
+            return
+        self.frame_count += 1
+        self.byte_count += byte_len
+        self.canvas.update_frame(img)
+
+    def _on_status(self, txt: str):
+        self.status_label.setText(txt)
+
+    def _on_error(self, err: str):
+        self.canvas.stop_loading()
+        self.status_label.setText(f"Fehler: {err}")
+
+    def _on_disconnected(self):
+        self.connect_btn.setText("Verbinden")
+        self.connect_btn.setStyleSheet("background-color: #2563eb; border-color: #1d4ed8;")
+        self.host_combo.setEnabled(True)
+        self.canvas.clear_frame()
+        self.stats_label.setText("")
+        self.stack.setCurrentWidget(self.selector_page)
+        self.status_label.setText("Verbindung getrennt – Bitte Maschine auswählen.")
+
+    def _update_stats(self):
+        if self.stream_thread and self.stream_thread.isRunning():
+            fps = self.frame_count
+            kbps = (self.byte_count * 8) / 1000.0
+            self.frame_count = 0
+            self.byte_count = 0
+            self.stats_label.setText(f"Monitor {self.current_mon_index}  |  {fps} FPS  |  {kbps:.0f} kbit/s")
+        else:
+            self.frame_count = 0
+            self.byte_count = 0
+
+    def is_control_enabled(self) -> bool:
+        return bool(self.ctrl_checkbox.isChecked() and self.stream_thread and self.stream_thread.isRunning())
+
+    def send_mouse_move(self, rx: float, ry: float):
+        if self.stream_thread:
+            self.stream_thread.send_cmd({"t": "m", "x": round(rx, 4), "y": round(ry, 4)})
+
+    def send_mouse_button(self, btn: int, pressed: bool, rx: float, ry: float):
+        if self.stream_thread:
+            self.stream_thread.send_cmd({"t": "b", "b": btn, "p": 1 if pressed else 0, "x": round(rx, 4), "y": round(ry, 4)})
+
+    def send_mouse_wheel(self, dy: int, dx: int):
+        if self.stream_thread:
+            self.stream_thread.send_cmd({"t": "w", "dy": dy, "dx": dx})
+
+    def send_key(self, evdev_code: int, pressed: bool):
+        if self.stream_thread:
+            self.stream_thread.send_cmd({"t": "k", "c": evdev_code, "p": 1 if pressed else 0})
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            self.fs_btn.setText("⛶ Vollbild")
+        else:
+            self.showFullScreen()
+            self.fs_btn.setText("⛶ Fenster")
+        self.canvas.setFocus()
+
+    def closeEvent(self, event):
+        if self.stream_thread and self.stream_thread.isRunning():
+            self.stream_thread.stop()
+            self.stream_thread.wait(1500)
+        super().closeEvent(event)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="LanView – Unbeaufsichtigtes Linux/Wayland Remote-Desktop-Tool über SSH (DRM/KMS + uinput)"
+    )
+    parser.add_argument(
+        "host", nargs="?", default=None,
+        help="Optionaler Ziel-Host oder Stations-ID beim Start (ohne Angabe öffnet sich die Maschinen-Auswahl)"
+    )
+    parser.add_argument(
+        "--sudo-pass", default="",
+        help="Optionales Sudo-Passwort falls kein NOPASSWD aktiv ist"
+    )
+    args = parser.parse_args()
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("LanView")
+    app.setDesktopFileName("lanview")
+    for icon_cand in (
+        os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps/lanview.svg"),
+        os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps/lanview.png"),
+    ):
+        if os.path.isfile(icon_cand):
+            app.setWindowIcon(QIcon(icon_cand))
+            break
+    win = LanViewWindow(initial_host=args.host, sudo_pass=args.sudo_pass)
+    if not app.windowIcon().isNull():
+        win.setWindowIcon(app.windowIcon())
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

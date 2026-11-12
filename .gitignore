@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.log
+*.swp
+.DS_Store
+# Never commit personal/internal station configs with real IPs or keys
+stations/*.json
+!stations/*.example.json

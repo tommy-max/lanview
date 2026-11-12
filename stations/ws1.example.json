@@ -1,0 +1,10 @@
+{
+  "id": "ws1",
+  "name": "Workstation 1 – Office PC",
+  "description": "Dual 1080p • Intel/AMD Graphics • KDE Plasma Wayland",
+  "host": "ws1",
+  "ip": "192.168.1.100",
+  "user": "linuxuser",
+  "default_fps": 25,
+  "default_scale": 0.75
+}
