@@ -37,6 +37,7 @@ Unbeaufsichtigter Fernzugriff unter **Linux Wayland** scheitert bei klassischen 
 - **Kein Dienst auf dem Ziel-PC:** Kein dauerhafter Daemon, kein offener Port außer Standard-SSH (Port 22).
 - **Funktioniert vor, während und nach dem Login:** Direkter Zugriff über Kernel-`DRM/KMS` und `/dev/uinput` – inklusive automatischem Watchdog beim Wechsel vom Login-Screen in die Wayland-Sitzung.
 - **Multi-Monitor-Umschaltung in Echtzeit:** Erkennung aller angeschlossenen Monitore (`M1`, `M2`, `M3` ...) mit korrektem Maus-Mapping pro Bildschirm.
+- **Bidirektionales Copy & Paste + Direkt-Tippen:** Automatische Echtzeit-Synchronisation der Zwischenablage zwischen Host und Ziel-PC (KDE Klipper DBus + Wayland/X11-Fallbacks) sowie **„📋 Tippen“ (`Strg+Alt+V`)** für Login-Screens (SDDM) und Terminals.
 - **Einzelne JSON-Konfigurationsdateien pro Maschine:** Übersichtlich verwaltbar unter `~/.config/lanview/stations/*.json`.
 
 ---

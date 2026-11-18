@@ -9,6 +9,7 @@ Funktionen:
 - Automatischer DRM/CRTC-Watchdog bei Login / Modeset / Lockscreen-Wechsel
 - Live-Bildschirmauswahl (Monitor 1, Monitor 2, Monitor 3 ...) mit Ladeanimation & sofortigem Umschalten
 - Verzögerungsfreie Maus- und Tastatursteuerung über Kernel /dev/uinput (inkl. nativer Linux-Scancodes)
+- Bidirektionale Echtzeit-Zwischenablage (Copy & Paste zwischen Host & Remote unter Wayland & X11) + Direkt-Tippen (Strg+Alt+V)
 """
 
 import sys
@@ -26,7 +27,7 @@ import argparse
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QSize, QTimer, QRectF
 from PyQt6.QtGui import (
-    QImage, QPixmap, QPainter, QColor, QFont, QIcon,
+    QImage, QPixmap, QPainter, QColor, QFont, QIcon, QClipboard,
     QKeyEvent, QMouseEvent, QWheelEvent, QPen
 )
 from PyQt6.QtWidgets import (
@@ -45,9 +46,11 @@ REMOTE_AGENT_CODE = r'''
 import sys
 import os
 import re
+import pwd
 import time
 import json
 import fcntl
+import shutil
 import struct
 import ctypes
 import hashlib
@@ -738,6 +741,124 @@ class UInputController:
             self._emit(self.kbd_fd, EV_KEY, evdev_code, 1 if pressed else 0)
             self._emit(self.kbd_fd, EV_SYN, 0, 0)
 
+    def _detect_kbd_layout(self):
+        if hasattr(self, "_cached_layout"):
+            return self._cached_layout
+        layout = "de"
+        nodead = False
+        for cfg in ("/etc/X11/xorg.conf.d/00-keyboard.conf", "/etc/vconsole.conf"):
+            try:
+                if os.path.isfile(cfg):
+                    txt = open(cfg, "r", encoding="utf-8", errors="ignore").read()
+                    if re.search(r'(?:XkbLayout|XKBLAYOUT|KEYMAP)\s*[= "\']+us\b', txt):
+                        layout = "us"
+                    if "nodeadkeys" in txt:
+                        nodead = True
+            except Exception:
+                pass
+        self._cached_layout = (layout, nodead)
+        return self._cached_layout
+
+    def type_text(self, text: str):
+        if not text or self.kbd_fd is None:
+            return
+        layout, nodead = self._detect_kbd_layout()
+        # Evtl. noch gedrückte Modifier (z. B. von Strg+Alt+V) sicher loslassen
+        for mod_code in (29, 97, 42, 54, 56, 100, 125, 126):
+            self.key(mod_code, False)
+        time.sleep(0.01)
+
+        de_letters = {
+            "a": 30, "b": 48, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34,
+            "h": 35, "i": 23, "j": 36, "k": 37, "l": 38, "m": 50, "n": 49,
+            "o": 24, "p": 25, "q": 16, "r": 19, "s": 31, "t": 20, "u": 22,
+            "v": 47, "w": 17, "x": 45, "y": 44, "z": 21,
+        }
+        us_letters = dict(de_letters, y=21, z=44)
+        digits = {"1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9, "9": 10, "0": 11}
+
+        # (keycode, shift, altgr, need_space_for_deadkey)
+        de_map = {
+            " ": (57, False, False, False), "\t": (15, False, False, False), "\n": (28, False, False, False),
+            "ä": (40, False, False, False), "Ä": (40, True, False, False),
+            "ö": (39, False, False, False), "Ö": (39, True, False, False),
+            "ü": (26, False, False, False), "Ü": (26, True, False, False),
+            "ß": (12, False, False, False),
+            "!": (2, True, False, False), '"': (3, True, False, False), "§": (4, True, False, False),
+            "$": (5, True, False, False), "%": (6, True, False, False), "&": (7, True, False, False),
+            "/": (8, True, False, False), "(": (9, True, False, False), ")": (10, True, False, False),
+            "=": (11, True, False, False), "?": (12, True, False, False),
+            "²": (3, False, True, False), "³": (4, False, True, False),
+            "{": (8, False, True, False), "[": (9, False, True, False),
+            "]": (10, False, True, False), "}": (11, False, True, False),
+            "\\": (12, False, True, False), "@": (16, False, True, False),
+            "€": (18, False, True, False), "~": (27, False, True, False),
+            "|": (86, False, True, False), "µ": (50, False, True, False),
+            "+": (27, False, False, False), "*": (27, True, False, False),
+            "#": (43, False, False, False), "'": (43, True, False, False),
+            "<": (86, False, False, False), ">": (86, True, False, False),
+            ",": (51, False, False, False), ";": (51, True, False, False),
+            ".": (52, False, False, False), ":": (52, True, False, False),
+            "-": (53, False, False, False), "_": (53, True, False, False),
+            "°": (41, True, False, False),
+            "^": (41, False, False, not nodead),
+            "`": (13, True, False, not nodead),
+        }
+        us_map = {
+            " ": (57, False, False, False), "\t": (15, False, False, False), "\n": (28, False, False, False),
+            "!": (2, True, False, False), "@": (3, True, False, False), "#": (4, True, False, False),
+            "$": (5, True, False, False), "%": (6, True, False, False), "^": (7, True, False, False),
+            "&": (8, True, False, False), "*": (9, True, False, False), "(": (10, True, False, False),
+            ")": (11, True, False, False), "-": (12, False, False, False), "_": (12, True, False, False),
+            "=": (13, False, False, False), "+": (13, True, False, False),
+            "[": (26, False, False, False), "{": (26, True, False, False),
+            "]": (27, False, False, False), "}": (27, True, False, False),
+            "\\": (43, False, False, False), "|": (43, True, False, False),
+            ";": (39, False, False, False), ":": (39, True, False, False),
+            "'": (40, False, False, False), '"': (40, True, False, False),
+            "`": (41, False, False, False), "~": (41, True, False, False),
+            ",": (51, False, False, False), "<": (51, True, False, False),
+            ".": (52, False, False, False), ">": (52, True, False, False),
+            "/": (53, False, False, False), "?": (53, True, False, False),
+        }
+
+        letters = us_letters if layout == "us" else de_letters
+        sym_map = us_map if layout == "us" else de_map
+
+        for ch in text:
+            if ch == "\r":
+                continue
+            entry = None
+            low = ch.lower()
+            if low in letters and ch.isascii():
+                entry = (letters[low], ch.isupper(), False, False)
+            elif ch in digits:
+                entry = (digits[ch], False, False, False)
+            elif ch in sym_map:
+                entry = sym_map[ch]
+            if not entry:
+                continue
+            kc, sh, ag, dead_sp = entry
+            if sh:
+                self.key(42, True)
+            if ag:
+                self.key(100, True)
+            if sh or ag:
+                time.sleep(0.002)
+            self.key(kc, True)
+            time.sleep(0.004)
+            self.key(kc, False)
+            if ag:
+                self.key(100, False)
+            if sh:
+                self.key(42, False)
+            if dead_sp:
+                time.sleep(0.003)
+                self.key(57, True)
+                time.sleep(0.003)
+                self.key(57, False)
+            time.sleep(0.004)
+
     def close(self):
         for fd in (self.ptr_fd, self.kbd_fd):
             if fd is not None:
@@ -1128,6 +1249,346 @@ class StreamWorker:
                 self.start_stream(mon_index=cur_mon["index"], force_restart=True)
 
 
+# --- 4. Bidirektionale Zwischenablage (KDE Klipper DBus + Wayland/X11 Fallbacks) ---
+USER_CLIP_HELPER = """
+import os, sys, json, time, shutil, threading, subprocess
+
+NL = chr(10)
+lock = threading.Lock()
+wake_ev = threading.Event()
+out_lock = threading.Lock()
+
+dbus_mod = None
+try:
+    import dbus as _dbus
+    dbus_mod = _dbus
+except Exception:
+    pass
+
+_bus = None
+_klipper = None
+
+def _get_klipper():
+    global _bus, _klipper
+    if dbus_mod is None:
+        return None
+    if _klipper is not None:
+        return _klipper
+    try:
+        if _bus is None:
+            _bus = dbus_mod.SessionBus()
+        obj = _bus.get_object("org.kde.klipper", "/klipper")
+        _klipper = dbus_mod.Interface(obj, "org.kde.klipper.klipper")
+        return _klipper
+    except Exception:
+        _klipper = None
+        return None
+
+def get_clip():
+    global _klipper
+    kl = _get_klipper()
+    if kl is not None:
+        try:
+            return str(kl.getClipboardContents())
+        except Exception:
+            _klipper = None
+    for qbin in ("qdbus6", "qdbus"):
+        if shutil.which(qbin):
+            try:
+                r = subprocess.run(
+                    [qbin, "org.kde.klipper", "/klipper", "org.kde.klipper.klipper.getClipboardContents"],
+                    capture_output=True, text=True, timeout=1.0
+                )
+                if r.returncode == 0:
+                    val = r.stdout
+                    if val.endswith(NL):
+                        val = val[:-1]
+                    return val
+            except Exception:
+                pass
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+        try:
+            r = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True, timeout=1.0)
+            if r.returncode == 0:
+                return r.stdout
+        except Exception:
+            pass
+    if os.environ.get("DISPLAY"):
+        if shutil.which("xclip"):
+            try:
+                r = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True, text=True, timeout=1.0)
+                if r.returncode == 0:
+                    return r.stdout
+            except Exception:
+                pass
+        if shutil.which("xsel"):
+            try:
+                r = subprocess.run(["xsel", "--clipboard", "--output"], capture_output=True, text=True, timeout=1.0)
+                if r.returncode == 0:
+                    return r.stdout
+            except Exception:
+                pass
+    return None
+
+def set_clip(text):
+    global _klipper
+    kl = _get_klipper()
+    if kl is not None:
+        try:
+            kl.setClipboardContents(text)
+            return True
+        except Exception:
+            _klipper = None
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        try:
+            subprocess.run(
+                ["wl-copy"], input=text, text=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5
+            )
+            return True
+        except Exception:
+            pass
+    if os.environ.get("DISPLAY"):
+        if shutil.which("xclip"):
+            try:
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard", "-i"], input=text, text=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5
+                )
+                return True
+            except Exception:
+                pass
+        if shutil.which("xsel"):
+            try:
+                subprocess.run(
+                    ["xsel", "--clipboard", "--input"], input=text, text=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5
+                )
+                return True
+            except Exception:
+                pass
+    return False
+
+def emit(obj):
+    with out_lock:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + NL)
+        sys.stdout.flush()
+
+init_val = get_clip()
+last_text = init_val if init_val is not None else ""
+
+def poll_loop():
+    global last_text
+    while True:
+        wake_ev.wait(0.4)
+        wake_ev.clear()
+        cur = get_clip()
+        if cur is None:
+            continue
+        with lock:
+            if cur and cur != last_text and len(cur) <= 2000000:
+                last_text = cur
+                emit({"clip": cur})
+
+threading.Thread(target=poll_loop, daemon=True).start()
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        cmd = json.loads(raw)
+    except Exception:
+        continue
+    op = cmd.get("op")
+    if op == "set":
+        txt = str(cmd.get("text", ""))
+        req_id = int(cmd.get("id", 0))
+        with lock:
+            last_text = txt
+        ok = set_clip(txt)
+        emit({"ack": req_id, "ok": ok})
+    elif op == "nudge":
+        wake_ev.set()
+"""
+
+
+class ClipboardBridge:
+    def __init__(self):
+        self.proc = None
+        self.active_uid = None
+        self.stop_flag = False
+        self.lock = threading.Lock()
+        self.ack_cond = threading.Condition()
+        self.req_seq = 0
+        self.last_ack_id = 0
+        self.pending_text = None
+        self.manager_thread = threading.Thread(target=self._manager_loop, daemon=True)
+        self.manager_thread.start()
+
+    def _find_desktop_user(self):
+        best_uid = None
+        best_score = -1
+        try:
+            for entry in sorted(os.listdir("/run/user")):
+                if not entry.isdigit():
+                    continue
+                uid = int(entry)
+                if uid < 1000:
+                    continue
+                rdir = f"/run/user/{entry}"
+                bus_path = os.path.join(rdir, "bus")
+                if not os.path.exists(bus_path):
+                    continue
+                score = 1
+                try:
+                    for fn in os.listdir(rdir):
+                        if re.match(r"^wayland-\d+$", fn):
+                            score = 3
+                            break
+                except Exception:
+                    pass
+                if score > best_score:
+                    best_score = score
+                    best_uid = uid
+        except Exception:
+            pass
+        return best_uid
+
+    def _spawn_helper(self, uid: int):
+        try:
+            pw = pwd.getpwuid(uid)
+        except Exception:
+            return None
+        rdir = f"/run/user/{uid}"
+        env = {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin",
+            "HOME": pw.pw_dir,
+            "USER": pw.pw_name,
+            "LOGNAME": pw.pw_name,
+            "XDG_RUNTIME_DIR": rdir,
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={rdir}/bus",
+        }
+        try:
+            for fn in sorted(os.listdir(rdir)):
+                if re.match(r"^wayland-\d+$", fn):
+                    env["WAYLAND_DISPLAY"] = fn
+                    break
+        except Exception:
+            pass
+        x_disp, x_auth = detect_x11_env()
+        if x_disp:
+            env["DISPLAY"] = x_disp
+        if x_auth and os.path.exists(x_auth):
+            env["XAUTHORITY"] = x_auth
+
+        try:
+            kwargs = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.DEVNULL,
+                "env": env,
+                "text": True,
+                "bufsize": 1,
+            }
+            if os.geteuid() == 0:
+                kwargs["user"] = uid
+                kwargs["group"] = pw.pw_gid
+            proc = subprocess.Popen(["python3", "-u", "-c", USER_CLIP_HELPER], **kwargs)
+            return proc
+        except Exception:
+            return None
+
+    def _reader_loop(self, proc):
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                if "ack" in msg:
+                    with self.ack_cond:
+                        self.last_ack_id = max(self.last_ack_id, int(msg["ack"]))
+                        self.ack_cond.notify_all()
+                elif "clip" in msg:
+                    txt = msg.get("clip")
+                    if isinstance(txt, str) and txt:
+                        send_json({"type": "clipboard", "text": txt})
+        except Exception:
+            pass
+
+    def _manager_loop(self):
+        while not self.stop_flag:
+            need_spawn = False
+            with self.lock:
+                if self.proc is None or self.proc.poll() is not None:
+                    need_spawn = True
+            if need_spawn:
+                uid = self._find_desktop_user()
+                if uid is not None:
+                    proc = self._spawn_helper(uid)
+                    if proc is not None:
+                        with self.lock:
+                            self.proc = proc
+                            self.active_uid = uid
+                            pend = self.pending_text
+                        threading.Thread(target=self._reader_loop, args=(proc,), daemon=True).start()
+                        if pend:
+                            self.set_text(pend, wait_ack=False)
+            time.sleep(2.0)
+
+    def _write_helper(self, obj: dict) -> bool:
+        with self.lock:
+            p = self.proc
+            if not p or p.poll() is not None or not p.stdin:
+                return False
+            try:
+                p.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                p.stdin.flush()
+                return True
+            except Exception:
+                return False
+
+    def set_text(self, text: str, wait_ack: bool = True):
+        if not isinstance(text, str) or len(text) > 2_000_000:
+            return
+        with self.ack_cond:
+            self.req_seq += 1
+            req_id = self.req_seq
+        with self.lock:
+            self.pending_text = text
+        if not self._write_helper({"op": "set", "id": req_id, "text": text}):
+            return
+        if wait_ack:
+            deadline = time.time() + 0.15
+            with self.ack_cond:
+                while self.last_ack_id < req_id:
+                    rem = deadline - time.time()
+                    if rem <= 0:
+                        break
+                    self.ack_cond.wait(timeout=rem)
+
+    def nudge_delayed(self, delay: float = 0.12):
+        def _do():
+            time.sleep(delay)
+            self._write_helper({"op": "nudge"})
+        threading.Thread(target=_do, daemon=True).start()
+
+    def close(self):
+        self.stop_flag = True
+        with self.lock:
+            p = self.proc
+            self.proc = None
+        if p:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
 def main():
     uinput = UInputController()
     time.sleep(0.15)
@@ -1148,6 +1609,7 @@ def main():
         "total_height": total_h
     })
 
+    clip_bridge = ClipboardBridge()
     streamer = StreamWorker(card_path, monitors, total_w, total_h, uinput=uinput)
     streamer.start_stream(mon_index=1, fps=25, scale_pct=75, quality=80, force_restart=True)
 
@@ -1173,6 +1635,19 @@ def main():
                 streamer.on_client_ack()
                 continue
 
+            if mtype == "clip":
+                clip_bridge.set_text(str(msg.get("text", "")), wait_ack=True)
+                continue
+
+            if mtype == "type":
+                txt_to_type = str(msg.get("text", ""))
+                if txt_to_type:
+                    def _run_type(t=txt_to_type):
+                        uinput.type_text(t)
+                        streamer.notify_user_input()
+                    threading.Thread(target=_run_type, daemon=True).start()
+                continue
+
             cur_mon = streamer.current_mon or monitors[0]
 
             if mtype == "m":
@@ -1192,6 +1667,8 @@ def main():
                     uinput.move_abs(gx, gy, streamer.total_w, streamer.total_h)
                 uinput.button(bcode, pressed)
                 streamer.notify_user_input()
+                if not pressed:
+                    clip_bridge.nudge_delayed(0.12)
 
             elif mtype == "w":
                 uinput.wheel(int(msg.get("dy", 0)), int(msg.get("dx", 0)))
@@ -1202,6 +1679,9 @@ def main():
                 pressed = bool(msg.get("p", False))
                 uinput.key(kcode, pressed)
                 streamer.notify_user_input()
+                # Nach Copy/Cut (C=46, X=45, Einfg=110) Clipboard sofort prüfen
+                if not pressed and kcode in (45, 46, 110):
+                    clip_bridge.nudge_delayed(0.10)
                 # Nach Enter / Return (Keycode 28 oder Numpad-Enter 96) beim Login nach 0.35s Stream auffrischen
                 if not pressed and kcode in (28, 96):
                     def refresh_after_enter():
@@ -1231,6 +1711,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        clip_bridge.close()
         streamer._stop_current()
         uinput.close()
 
@@ -1303,6 +1784,7 @@ def load_station_configs() -> list:
 class SSHStreamThread(QThread):
     frame_received = pyqtSignal(int, QImage, int)  # (mon_index, image, byte_len)
     init_received = pyqtSignal(dict)
+    clipboard_received = pyqtSignal(str)
     status_received = pyqtSignal(str)
     error_received = pyqtSignal(str)
     disconnected = pyqtSignal()
@@ -1402,6 +1884,10 @@ class SSHStreamThread(QThread):
                         mtype = msg.get("type")
                         if mtype == "init":
                             self.init_received.emit(msg)
+                        elif mtype == "clipboard":
+                            txt = msg.get("text")
+                            if isinstance(txt, str):
+                                self.clipboard_received.emit(txt)
                         elif mtype == "error":
                             self.error_received.emit(msg.get("message", "Unbekannter Remote-Fehler"))
                     except Exception:
@@ -1590,12 +2076,18 @@ class VideoCanvas(QWidget):
             self._last_move_sent = now
             self.parent_win.send_mouse_move(coords[0], coords[1])
 
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.parent_win.sync_local_clipboard_if_changed()
+
     def mousePressEvent(self, event: QMouseEvent):
         self.setFocus()
         if not self.parent_win.is_control_enabled():
             return
         coords = self._map_pos_to_normalized(event.position())
         btn = self._qt_btn_to_code(event.button())
+        if btn in (2, 3):
+            self.parent_win.sync_local_clipboard_if_changed()
         if btn and coords:
             self.parent_win.send_mouse_button(btn, True, coords[0], coords[1])
 
@@ -1618,16 +2110,28 @@ class VideoCanvas(QWidget):
             self.parent_win.send_mouse_wheel(dy, dx)
 
     def keyPressEvent(self, event: QKeyEvent):
-        if event.key() == Qt.Key.Key_F and (event.modifiers() & Qt.KeyboardModifier.ControlModifier) and (event.modifiers() & Qt.KeyboardModifier.AltModifier):
-            self.parent_win.toggle_fullscreen()
-            event.accept()
-            return
+        mods = event.modifiers()
+        if (mods & Qt.KeyboardModifier.ControlModifier) and (mods & Qt.KeyboardModifier.AltModifier):
+            if event.key() == Qt.Key.Key_F:
+                self.parent_win.toggle_fullscreen()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_V:
+                self.parent_win.type_clipboard_on_remote()
+                event.accept()
+                return
 
         if not self.parent_win.is_control_enabled():
             return
         if event.isAutoRepeat():
             return
         evdev_code = event.nativeScanCode() - 8
+        # Vor Strg+V / Strg+Umschalt+V (V=47) oder Umschalt+Einfg (Insert=110) sicherstellen,
+        # dass aktuelle lokale Zwischenablage auf dem Ziel-PC gesetzt ist:
+        if (evdev_code == 47 and (mods & Qt.KeyboardModifier.ControlModifier)) or (
+            evdev_code == 110 and (mods & Qt.KeyboardModifier.ShiftModifier)
+        ):
+            self.parent_win.sync_local_clipboard_if_changed()
         if 1 <= evdev_code <= 247:
             self.parent_win.send_key(evdev_code, True)
             event.accept()
@@ -1758,9 +2262,18 @@ class LanViewWindow(QMainWindow):
 
         self.frame_count = 0
         self.byte_count = 0
+        self._last_synced_clip_text = None
+        self._setting_local_clip = False
 
         self._build_ui()
         self.reload_stations()
+
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.dataChanged.connect(self._on_local_clipboard_changed)
+        app_inst = QApplication.instance()
+        if app_inst is not None:
+            app_inst.applicationStateChanged.connect(self._on_app_state_changed)
 
         self.stats_timer = QTimer(self)
         self.stats_timer.timeout.connect(self._update_stats)
@@ -1874,6 +2387,13 @@ class LanViewWindow(QMainWindow):
         tb_layout.addWidget(self.ctrl_checkbox)
 
         tb_layout.addStretch(1)
+
+        self.paste_type_btn = QPushButton("📋 Tippen", self)
+        self.paste_type_btn.setToolTip(
+            "Zwischenablage als Tastendrücke tippen – ideal für SDDM Login-Screen & Terminals (Strg+Alt+V)"
+        )
+        self.paste_type_btn.clicked.connect(self.type_clipboard_on_remote)
+        tb_layout.addWidget(self.paste_type_btn)
 
         self.wake_btn = QPushButton("⚡ Aufwecken / Refresh", self)
         self.wake_btn.setToolTip("Weckt Monitore auf und aktualisiert den Video-Stream")
@@ -2127,6 +2647,7 @@ class LanViewWindow(QMainWindow):
         self.stack.setCurrentWidget(self.canvas)
         self.canvas.start_loading(f"Verbinde mit {display_name} ...")
 
+        self._last_synced_clip_text = None
         self.stream_thread = SSHStreamThread(
             target,
             sudo_pass=sudo_pass,
@@ -2135,6 +2656,7 @@ class LanViewWindow(QMainWindow):
         )
         self.stream_thread.frame_received.connect(self._on_frame)
         self.stream_thread.init_received.connect(self._on_init)
+        self.stream_thread.clipboard_received.connect(self._on_remote_clipboard)
         self.stream_thread.status_received.connect(self._on_status)
         self.stream_thread.error_received.connect(self._on_error)
         self.stream_thread.disconnected.connect(self._on_disconnected)
@@ -2172,6 +2694,8 @@ class LanViewWindow(QMainWindow):
             self.canvas.start_loading(f"Lade {self.monitors[0]['label']} ...")
         # Gewünschte FPS & Skalierung der gewählten Station anwenden
         self._send_stream_config()
+        # Aktuelle lokale Zwischenablage direkt beim Verbinden bereitstellen
+        self.sync_local_clipboard_if_changed(force=True)
         disp = getattr(self, "active_display_name", "Remote-Host")
         self.status_label.setText(
             f"Verbunden mit {disp} | {len(self.monitors)} Monitor(e) erkannt (Gesamtfläche: {tw}x{th})"
@@ -2290,6 +2814,56 @@ class LanViewWindow(QMainWindow):
     def send_key(self, evdev_code: int, pressed: bool):
         if self.stream_thread:
             self.stream_thread.send_cmd({"t": "k", "c": evdev_code, "p": 1 if pressed else 0})
+
+    def sync_local_clipboard_if_changed(self, force: bool = False):
+        if self._setting_local_clip:
+            return
+        if not self.stream_thread or not self.stream_thread.isRunning():
+            return
+        cb = QApplication.clipboard()
+        if cb is None:
+            return
+        txt = cb.text(QClipboard.Mode.Clipboard)
+        if not txt or len(txt) > 2_000_000:
+            return
+        if not force and txt == self._last_synced_clip_text:
+            return
+        self._last_synced_clip_text = txt
+        self.stream_thread.send_cmd({"t": "clip", "text": txt})
+
+    def _on_local_clipboard_changed(self):
+        self.sync_local_clipboard_if_changed()
+
+    def _on_app_state_changed(self, state):
+        if state == Qt.ApplicationState.ApplicationActive:
+            self.sync_local_clipboard_if_changed()
+
+    def _on_remote_clipboard(self, txt: str):
+        if not txt or txt == self._last_synced_clip_text:
+            return
+        self._last_synced_clip_text = txt
+        self._setting_local_clip = True
+        try:
+            cb = QApplication.clipboard()
+            if cb is not None:
+                cb.setText(txt, QClipboard.Mode.Clipboard)
+        finally:
+            self._setting_local_clip = False
+
+    def type_clipboard_on_remote(self):
+        if not self.is_control_enabled():
+            return
+        cb = QApplication.clipboard()
+        if cb is None:
+            return
+        txt = cb.text(QClipboard.Mode.Clipboard)
+        if not txt:
+            self.status_label.setText("Zwischenablage ist leer – nichts zum Tippen.")
+            self.canvas.setFocus()
+            return
+        self.stream_thread.send_cmd({"t": "type", "text": txt})
+        self.status_label.setText(f"Tippe {len(txt)} Zeichen aus der Zwischenablage auf Ziel-PC ...")
+        self.canvas.setFocus()
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
